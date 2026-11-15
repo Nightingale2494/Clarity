@@ -168,3 +168,10 @@ Open `http://localhost:5173` in your browser.
 python -m pytest tests/test_free_features.py tests/test_llm_backend.py -v
 cd dashboard && npm run lint && npm run build
 ```
+
+---
+
+## License
+
+Licensed under the **Apache License, Version 2.0**. See [LICENSE](./LICENSE) for full details.
+
