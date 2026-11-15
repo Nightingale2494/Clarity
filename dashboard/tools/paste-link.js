@@ -104,8 +104,8 @@ function go(url, platform) {
   track('tool_used', { tool: TOOL, ok: true, page, platform: platform || 'other' })
   track('SeoCtaClick', { page, source: TOOL })
   try {
-    localStorage.setItem('os_pending_url', url)
-    localStorage.setItem('openshorts_skip_landing', '1')
+    localStorage.setItem('clarity_pending_url', url)
+    localStorage.setItem('clarity_skip_landing', '1')
   } catch (_) { /* private mode: the app still opens, without the link */ }
   window.location.href = '/#app'
 }
@@ -142,5 +142,5 @@ input.addEventListener('input', () => { if (!status.hidden) setStatus(status, ''
 // "Upload a file instead" opens the app on the upload tab, nothing stored.
 $('pl-upload')?.addEventListener('click', () => {
   track('tool_cta_click', { tool: TOOL, page, kind: 'upload' })
-  try { localStorage.setItem('openshorts_skip_landing', '1') } catch (_) { /* private mode */ }
+  try { localStorage.setItem('clarity_skip_landing', '1') } catch (_) { /* private mode */ }
 })

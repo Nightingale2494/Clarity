@@ -29,10 +29,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
-from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from s3_uploader import upload_job_artifacts, list_all_clips
 import recut
 import layout_ranges
-import watermarked
 import media_auth
 import remote_worker
 import yt_account
@@ -124,51 +123,105 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-# ---- Cloud billing (paid / managed-keys) integration --------------------------
-# All paid-mode code lives in the optional `cloud/` package and is imported ONLY
-# when BILLING_ENABLED is set. With the flag off, the app behaves exactly as the
-# self-hosted BYOK app does today (no extra dependencies required).
-BILLING_ENABLED = os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
+# ---- Free / Self-Hosted Configuration -----------------------------------------
+BILLING_ENABLED = False
 
-# Job/file retention (issue #46). Self-host defaults to 24h: the 1h sweep kept
-# deleting finished projects under users who never touched their env, and the
-# OUTPUT_MAX_GB / UPLOADS_MAX_GB caps below already bound the disk. Cloud keeps
-# the tight default because clips are archived to R2 as soon as a job finishes.
+# Job/file retention (issue #46). Defaults to 24h.
 JOB_RETENTION_SECONDS = int(
-    os.environ.get("JOB_RETENTION_SECONDS", "3600" if BILLING_ENABLED else "86400")
+    os.environ.get("JOB_RETENTION_SECONDS", "86400")
 )
-# The retained download of a URL job (--keep-original) is the one artifact that
-# is a full copy of someone else's video rather than something we made, so it
-# can be aged out ahead of the clips it produced. Defaults to the job clock,
-# i.e. no change: dropping it earlier costs the clip editor, whose rerender,
-# reframe, scenes and EDL endpoints all read that file and answer 409 once it
-# is gone. Lower it only if you would rather lose in-session re-edits than
-# keep the original around. Uploads are deliberately untouched: that file is
-# the user's own content, which they attested to owning.
 SOURCE_RETENTION_SECONDS = int(
     os.environ.get("SOURCE_RETENTION_SECONDS", str(JOB_RETENTION_SECONDS))
 )
-# Force full pipeline logs to the client even under billing (local debugging).
 DEBUG_LOGS = os.environ.get("DEBUG_LOGS", "").lower() in ("1", "true", "yes")
 
-if BILLING_ENABLED:
-    import cloud
-    from cloud import managed_keys, metering as _metering, config as _cloud_config, alerts as _alerts
-    from cloud.auth import get_current_user_optional
-else:
-    cloud = None
-    managed_keys = None
-    _metering = None
-    _cloud_config = None
-    _alerts = None
+cloud = None
+managed_keys = None
+_metering = None
+_cloud_config = None
+_alerts = None
 
-    async def get_current_user_optional(request: Request):
-        # No-op dependency in self-host mode: every request is anonymous / BYOK.
+
+async def get_current_user_optional(request: Request):
+    # No-op dependency in free mode: every request is anonymous / BYOK.
+    return None
+
+
+class _QueueModeStub:
+    NORMAL = "normal"
+    SLOW = "slow"
+    PAID_PRIORITY = 1
+    FREE_PRIORITY = 2
+    SLOW_PRIORITY = 3
+
+    @staticmethod
+    def enabled() -> bool:
+        return False
+
+    @staticmethod
+    def slow_lane_on() -> bool:
+        return False
+
+    @staticmethod
+    def brake_active() -> bool:
+        return False
+
+    @staticmethod
+    def effective_priority(priority: int) -> int:
+        return int(priority)
+
+    @staticmethod
+    def lane_of_priority(priority: int) -> str:
+        return "slow" if int(priority) >= 3 else "normal"
+
+    @staticmethod
+    def recent_first(lane: str = "normal") -> bool:
+        return False
+
+    @staticmethod
+    def register_on_change(fn) -> None:
+        pass
+
+    @staticmethod
+    def enabled_since():
         return None
 
-# The free queue's saturation mode (lanes, newest first, brake). Plain policy
-# with no dependencies, importable with billing off; inert unless configured.
-from cloud import queue_mode as _queue_mode
+    @staticmethod
+    def limits() -> dict:
+        return {"brake_clips": 5}
+
+    @staticmethod
+    def lane_for(plan, country):
+        return "normal"
+
+    @staticmethod
+    def request_country(headers, ip=None):
+        return ""
+
+
+_queue_mode = _QueueModeStub()
+
+
+class _CloudCfgStub:
+    PARTIAL_MIN_MINUTES = 3
+    FIRST_VIDEO_MAX_MINUTES = 30
+    THUMBNAIL_SOURCE_MINUTES_PER_CHARGED = 30
+    TRANSCRIBE_MINUTES = 1
+    THUMBNAIL_MAX_SOURCE_MINUTES = 180
+    THUMBNAIL_TEXT_CALLS_PER_HOUR = 60
+    THUMBNAIL_REFINES_PER_SESSION = 40
+    THUMBNAIL_MESSAGE_MAX_CHARS = 2000
+    THUMBNAIL_TITLE_MAX_CHARS = 300
+    THUMBNAIL_CONVERSATION_MAX_TURNS = 20
+    DESCRIBE_TRANSCRIPT_MAX_CHARS = 200000
+
+    @staticmethod
+    def billable_minutes(m):
+        return max(1, int(math.floor(float(m))))
+
+
+def _cloud_cfg():
+    return _CloudCfgStub
 
 
 def _saturation_on() -> bool:
@@ -196,7 +249,17 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     header = request.headers.get("X-Gemini-Key")
     if header:
         return header
-    return os.environ.get("GEMINI_API_KEY")
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+    try:
+        import ai_hub
+        s = ai_hub.load_settings()
+        if s.get("provider", "gemini") == "gemini" and s.get("api_key"):
+            return s.get("api_key")
+    except Exception:
+        pass
+    return None
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -275,40 +338,17 @@ def payment_required(error: str, message: str, **extra) -> HTTPException:
 
 
 def gemini_missing_error():
-    """The right 4xx when no Gemini key could be resolved.
-
-    402 for a signed-in-but-not-entitled cloud user (needs a plan); 400 otherwise
-    (BYOK header simply missing).
-    """
-    if BILLING_ENABLED:
-        return payment_required(
-            "no_plan", "This action needs an active OpenShorts plan (or the user's own API key).")
+    """The right 4xx when no Gemini key could be resolved."""
     return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
 
-# Probe rate limiter. In-memory, resets on restart by design — the hard monthly
-# quota lives in the metering ledger; this only stops someone hammering the
-# proxy with metadata probes.
+# Probe rate limiter. In-memory, resets on restart by design.
 _probe_times: dict = {}  # user_id -> [monotonic timestamps]
 PROBES_PER_HOUR = 15
 
-# Out-of-minutes upsell email: at most one per user per day (a client may
-# retry the same 402 many times).
-_last_quota_email: dict = {}
-_QUOTA_EMAIL_COOLDOWN = 24 * 3600
-
 
 def _maybe_send_quota_email(user):
-    if user is None or user.plan != "free" or not user.email:
-        return
-    now = time.monotonic()
-    last = _last_quota_email.get(str(user.id))
-    if last is not None and now - last < _QUOTA_EMAIL_COOLDOWN:
-        return
-    _last_quota_email[str(user.id)] = now
-    from cloud.emails import send_out_of_minutes_email
-    upgrade_url = f"{_cloud_config.settings.frontend_url}/#/pricing?src=email_quota"
-    asyncio.create_task(send_out_of_minutes_email(user.email, upgrade_url, user.id))
+    return
 
 
 # Free editor actions (reserve_managed_action with 0 minutes): same in-memory
@@ -376,13 +416,8 @@ def _check_probe_rate(user_id):
 
 
 def partial_offer(minutes_required: float, minutes_remaining: float) -> int:
-    """Minutes of the source we can offer to clip instead of a 402, or 0.
-
-    The offer is the caller's whole remaining balance, floored to full minutes
-    (the reservation is in whole minutes), and only when it is both worth
-    clipping (``PARTIAL_MIN_MINUTES``) and actually shorter than the source.
-    """
-    from cloud import config as _cfg  # plain constants; importable with billing off
+    """Minutes of the source we can offer to clip instead of a 402, or 0."""
+    _cfg = _cloud_cfg()
     offer = int(math.floor(max(0.0, float(minutes_remaining or 0))))
     if offer < _cfg.PARTIAL_MIN_MINUTES or offer >= minutes_required:
         return 0
@@ -390,22 +425,14 @@ def partial_offer(minutes_required: float, minutes_remaining: float) -> int:
 
 
 def plan_partial_minutes(minutes_required: int, minutes_remaining: float, max_minutes):
-    """How many minutes to reserve for a source of ``minutes_required``.
-
-    Returns ``(reserve, partial)``: ``partial`` is None for a normal whole-video
-    job, or ``{"processed_minutes", "total_minutes"}`` when the caller asked
-    (``max_minutes``) to clip only the first part. The slice is capped by the
-    balance as well as by the request, so a client cannot name a bigger cut
-    than it can pay for; when the slice would be too small the request falls
-    through to the ordinary quota check (and its 402).
-    """
+    """How many minutes to reserve for a source of ``minutes_required``."""
     if max_minutes is None:
         return minutes_required, None
     try:
         asked = float(max_minutes)
     except (TypeError, ValueError):
         return minutes_required, None
-    from cloud import config as _cfg
+    _cfg = _cloud_cfg()
     cap = int(math.floor(min(asked, max(0.0, float(minutes_remaining or 0)))))
     if minutes_required <= cap or cap < _cfg.PARTIAL_MIN_MINUTES:
         return minutes_required, None
@@ -413,20 +440,8 @@ def plan_partial_minutes(minutes_required: int, minutes_remaining: float, max_mi
 
 
 def free_overflow(plan, minutes_required, minutes_remaining, max_minutes, processed_before):
-    """What a free account gets for a source longer than its balance.
-
-    Returns ``(grant, max_minutes)``:
-
-    * ``grant`` is the whole (floored) balance when this is the account's first
-      video and it fits ``FIRST_VIDEO_MAX_MINUTES``: the video is clipped whole
-      and only the balance is charged, so it lands at zero.
-    * otherwise ``max_minutes`` becomes the balance, so the job clips the first
-      N minutes (``plan_partial_minutes``) instead of answering with the wall.
-
-    Anything else (a paid plan, a source that fits, a client that already named
-    its own cut) passes through untouched.
-    """
-    from cloud import config as _cfg
+    """What a free account gets for a source longer than its balance."""
+    _cfg = _cloud_cfg()
     remaining = max(0.0, float(minutes_remaining or 0))
     if plan != "free" or max_minutes is not None or minutes_required <= remaining:
         return None, max_minutes
@@ -579,7 +594,22 @@ async def reserve_process_minutes(request, url, input_path, job_id, max_minutes=
     on the operator's key for free. Only skip metering when billing is off.
     """
     if not BILLING_ENABLED:
-        return None, 2, None, None, None
+        partial = None
+        if source_range:
+            probed = 0.0
+            if input_path and os.path.exists(input_path):
+                probed = _media_duration_seconds(input_path) / 60.0
+            chosen = plan_source_range(probed, source_range)
+            if chosen is not None:
+                chosen_minutes = max(1, int(math.ceil((chosen["end_seconds"] - chosen["start_seconds"]) / 60.0)))
+                partial = {
+                    "processed_minutes": chosen_minutes,
+                    "total_minutes": max(1, int(math.ceil(probed))) if probed else chosen_minutes,
+                    "start_seconds": chosen["start_seconds"],
+                    "end_seconds": chosen["end_seconds"],
+                    "chosen": True,
+                }
+        return None, 2, None, None, partial
     user = await _user_from_request(request)
     if not managed_keys.has_active_entitlement(user):
         return None, 2, None, None, None  # shouldn't happen (resolve_gemini would have 402'd)
@@ -641,7 +671,7 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
     if balance["remaining"] < 1:
         _maybe_send_quota_email(user)
         raise payment_required(
-            "quota_exceeded", "The user is out of OpenShorts processing minutes for this period.",
+            "quota_exceeded", "The user is out of Clarity processing minutes for this period.",
             minutes_required=1, minutes_remaining=balance["remaining"], partial_minutes=0)
 
     # Free queue lane, then the brake: before the probe, the reservation and
@@ -1523,15 +1553,9 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
 
 
 def _strip_watermark_copy(output_dir, filename):
-    """``wm_<final>`` -> ``<final>`` when the clean twin is on disk.
-
-    The free plan serves a marked copy of the final file and keeps the clean
-    one next to it (see the ``watermarked`` module); every derivation starts
-    from the clean one, so the mark is always the outermost layer to strip.
-    Same fail-safe contract as the other walk-backs: unchanged when there is
-    nothing to strip or the twin is gone."""
-    if watermarked.is_marked(filename):
-        clean = watermarked.clean_name(filename)
+    """``wm_<final>`` -> ``<final>`` when the clean twin is on disk."""
+    if filename.startswith("wm_"):
+        clean = filename[3:]
         if os.path.exists(os.path.join(output_dir, clean)):
             return clean
     return filename
@@ -1576,76 +1600,18 @@ def _strip_burned_hook(output_dir, filename):
 
 
 async def _deliver(request, job_id, filename):
-    """The name to serve for a freshly derived clip file: the file itself, or
-    on the free plan its ``wm_`` copy (``main.mark_delivery``).
-
-    Decided from the caller's plan right now, not from the job's flag: the
-    flag is lost on a restart/restore, and a user who upgraded mid-session
-    must get clean files from their next edit on. Self-host never marks."""
-    if not BILLING_ENABLED:
-        return filename
-    user = await _user_from_request(request)
-    if user is None or user.plan != "free":
-        return filename
-    output_dir = os.path.join(OUTPUT_DIR, job_id)
-    # Only jobs the pipeline rendered under this scheme (marker file). A job
-    # from before it has the mark burned into its canonical, so every
-    # derivative already carries one and a copy would stack a second.
-    if not watermarked.job_is_marked(output_dir):
-        return filename
-    import main as _main
-    marked = await asyncio.get_event_loop().run_in_executor(
-        None, _main.mark_delivery, os.path.join(output_dir, filename))
-    return os.path.basename(marked)
+    """Return the filename to serve for a freshly derived clip file (no watermark)."""
+    return filename
 
 
 def _media_guard(path: str) -> bool:
-    """``/videos`` allowlist: deliverable types only (media_auth), and on a
-    job rendered for the free plan never the clean twin of a served clip.
-    The twins exist so an upgrade can re-point at them, not for stripping
-    ``wm_`` off a URL."""
-    if not media_auth.is_servable(path):
-        return False
-    job_id, _, filename = path.replace("\\", "/").strip("/").partition("/")
-    if not filename or not watermarked.is_clean_deliverable(filename):
-        return True
-    return not watermarked.job_is_marked(os.path.join(OUTPUT_DIR, job_id))
+    """``/videos`` allowlist: deliverable types only (media_auth)."""
+    return media_auth.is_servable(path)
 
 
 def _unmark_local_job(job_id, clip_index, clean_filename):
-    """After an upgrade: point the working copy of a clip at its clean twin.
-
-    Called by cloud/videos.unmark_user_library for every clip it re-pointed
-    in R2, so a dashboard still open on the job polls clean URLs from the
-    in-memory result and a later restore/recovery reads them from the
-    metadata. The marked file and the marker go, so the /videos guard opens
-    the twins again."""
-    job_dir = os.path.join(OUTPUT_DIR, job_id)
-    url = f"/videos/{job_id}/{clean_filename}"
-    job = jobs.get(job_id)
-    mem_clips = ((job or {}).get('result') or {}).get('clips') or []
-    if clip_index < len(mem_clips):
-        mem_clips[clip_index]['video_url'] = url
-    ready = (job or {}).get('ready_files')
-    if isinstance(ready, dict) and clip_index in ready:
-        ready[clip_index] = clean_filename
-    for meta_path in glob.glob(os.path.join(job_dir, "*_metadata.json")):
-        try:
-            with open(meta_path, 'r') as f:
-                data = json.load(f)
-            shorts = data.get('shorts', [])
-            if clip_index < len(shorts):
-                shorts[clip_index]['video_url'] = url
-                write_json_atomic(meta_path, data, indent=4)
-        except Exception as e:
-            print(f"⚠️ Could not unmark metadata of {job_id}: {e}")
-    watermarked.unmark_job(job_dir)
-    marked_path = os.path.join(job_dir, watermarked.marked_name(clean_filename))
-    if os.path.exists(marked_path):
-        try:
-            os.remove(marked_path)
-        except OSError:
-            pass
+    """No-op compatibility hook."""
+    return
 
 
 def _reapply_captions(job_id, clip_index, video_path):
@@ -2362,10 +2328,7 @@ def _register_resumed(picked) -> int:
                 env["GEMINI_API_KEY"] = managed_keys.gemini_key()
             except Exception:
                 pass
-        if m.get("watermark"):
-            env["WATERMARK"] = "1"
-        else:
-            env.pop("WATERMARK", None)
+        env.pop("WATERMARK", None)
         partial = m.get("partial")
         _apply_source_cut(env, partial)
         if m.get("source_cap_minutes"):
@@ -2939,20 +2902,6 @@ async def cleanup_jobs():
             _enforce_output_size_cap()
             _enforce_uploads_size_cap()
 
-            # Cleanup SaaSShorts jobs from memory
-            try:
-                saas_expired = [
-                    jid for jid, jdata in list(saas_jobs.items())
-                    if jdata.get("status") in ("completed", "failed")
-                    and jdata.get("output_dir")
-                    and os.path.isdir(jdata["output_dir"])
-                    and now - os.path.getmtime(jdata["output_dir"]) > JOB_RETENTION_SECONDS
-                ]
-                for jid in saas_expired:
-                    del saas_jobs[jid]
-            except NameError:
-                pass
-
             # Agent upload slots: expire with their file (the file sweep below
             # removes it; a slot whose file is gone or too old is dropped).
             for uid in _sweep_pending_uploads(now):
@@ -3455,31 +3404,8 @@ async def _archive_managed_job(job_id):
 
 
 async def _unmark_if_owner_paid(job_id, job):
-    """A job queued (or running) on the free plan carries the mark; if its owner
-    is on a live paid plan when it lands, the upgrade's promise covers it too.
-
-    The upgrade webhook unmarks only the clips that exist at that moment, so
-    this runs at delivery, after the archive and before the webhook and the
-    clips-ready email: the same re-pointing as an upgrade
-    (``videos.unmark_user_library``) limited to this job. Canonical files were
-    never marked; the twins are re-pointed only when they are in R2, and
-    ``_unmark_local_job`` drops ``.marked`` with them. Never raises: a failure
-    leaves the job marked, as it was.
-    """
-    if not BILLING_ENABLED or not job or job.get('status') != 'completed':
-        return
-    owner = job.get('user_id')
-    job_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
-    if owner is None or not watermarked.job_is_marked(job_dir):
-        return
-    try:
-        if str(owner) not in await _owner_live_plans([str(owner)]):
-            return
-        n = await cloud.videos.unmark_user_library(owner, job_id=job_id)
-        if n:
-            print(f"🏷️ Delivered {job_id} clean: its owner paid while it waited.")
-    except Exception as e:
-        print(f"⚠️ Could not unmark {job_id} for its paying owner: {e}")
+    """No-op in free mode (clips are never watermarked)."""
+    return
 
 
 def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
@@ -3729,9 +3655,10 @@ async def _webhook_clip_entries(job_id, job):
 
 
 async def _deliver_webhook(url, body: bytes, secret):
-    headers = {"Content-Type": "application/json", "User-Agent": "OpenShorts-Webhook/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "Clarity-Webhook/1.0"}
     if secret:
-        headers["X-OpenShorts-Signature"] = _sign_webhook(body, secret)
+        sig = _sign_webhook(body, secret)
+        headers["X-Clarity-Signature"] = sig
     from security_utils import assert_public_url, UnsafeURLError
     loop = asyncio.get_event_loop()
     for attempt, delay in enumerate(WEBHOOK_RETRY_DELAYS, 1):
@@ -3859,16 +3786,6 @@ def _purge_local_jobs_for_user(user_id) -> int:
                 os.remove(path)
             except OSError:
                 pass
-        removed += 1
-
-    for jid, job in list(saas_jobs.items()):
-        if not _owned_by(job, uid):
-            continue
-        out = job.get('output_dir')
-        # Only a SaaSShorts job folder, never a shared one it may have been pointed at.
-        if out and os.path.basename(out).startswith("saas_"):
-            _rm_under(OUTPUT_DIR, os.path.basename(out))
-        saas_jobs.pop(jid, None)
         removed += 1
 
     for sid, sess in list(thumbnail_sessions.items()):
@@ -4233,8 +4150,6 @@ async def _media_owner(kind: str, segment: str) -> Optional[str]:
         owner = _uid(thumbnail_sessions.get(segment))
         return owner or _read_owner_marker(os.path.join(THUMBNAILS_DIR, segment))
     owner = _uid(jobs.get(segment))
-    if owner is None and segment.startswith("saas_"):
-        owner = _uid(saas_jobs.get(segment[len("saas_"):]))
     if owner is None:
         owner = _read_owner_marker(os.path.join(OUTPUT_DIR, segment))
     if owner is None:
@@ -4448,9 +4363,6 @@ def _handle_job_line(job_id, line, remote=False):
             plain = not remote or (os.sep not in filename and "/" not in filename
                                    and filename.lower().endswith(".mp4")
                                    and remote_worker.safe_relpath(filename) == filename)
-            if remote and plain and (jobs.get(job_id) or {}).get('watermark'):
-                # Free plan: only the marked copy is ever announced.
-                plain = watermarked.is_marked(filename)
             if job_id in jobs and plain:
                 jobs[job_id].setdefault('ready_files', {})[int(index)] = filename
         except ValueError:
@@ -4828,11 +4740,6 @@ async def _run_job_remote(job_id, job_data):
         # leaves an encode recipe next to the clip, and a recipe is something
         # this host runs later, so it never comes from another machine.
         options["HOOK_LAZY"] = "0"
-        if job_data['env'].get("WATERMARK") == "1":
-            # Free plan: the mark is this host's to set, and it is set before
-            # the worker can send anything, so /videos refuses the clean
-            # deliverables from the first file on.
-            watermarked.mark_job(output_dir)
         if not remote_worker.set_ready(output_dir, source, parsed[1], options):
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(REMOTE_LOST_LOG)
@@ -5066,6 +4973,24 @@ async def worker_done(job_id: str, request: Request):
     return {"ok": True}
 
 
+def _local_or_hub_llm_describe():
+    desc = llm_backend.describe()
+    if desc:
+        return desc
+    try:
+        import ai_hub
+        s = ai_hub.load_settings()
+        if s.get("provider", "gemini") != "gemini" and ai_hub.is_ready():
+            return {
+                "provider": s.get("provider"),
+                "model": (s.get("models") or [s.get("provider")])[0],
+                "baseUrl": s.get("base_url", ""),
+            }
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/api/config")
 async def get_config():
     return {
@@ -5074,8 +4999,8 @@ async def get_config():
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
         # Self-host only: tells the dashboard the Gemini key is optional
-        # because the moment picker runs on an OpenAI-compatible server.
-        "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # because the moment picker runs on an OpenAI-compatible server or AI Hub.
+        "localLlm": None if BILLING_ENABLED else _local_or_hub_llm_describe(),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5462,8 +5387,8 @@ async def process_endpoint(
     source_end: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
-        # Self-host with an OpenAI-compatible server configured needs no
+    if not api_key and not (_local_or_hub_llm_describe() and not BILLING_ENABLED):
+        # Self-host with an OpenAI-compatible server or AI Hub configured needs no
         # Google key for the core pipeline: the moment picker runs there and
         # the frame-based stages degrade on their own (layout_picker returns
         # "none", silent videos fail with a message that says why).
@@ -5771,10 +5696,7 @@ async def process_endpoint(
         # main.py cuts the source down to this many minutes before anything
         # reads it, so the whole pipeline (and the editor) sees a short video.
         _apply_source_cut(env, partial)
-    if user_plan == "free":
-        # Free-plan clips carry a burned-in watermark (applied by the main.py
-        # subprocess after each clip renders).
-        env["WATERMARK"] = "1"
+    env.pop("WATERMARK", None)
 
     # Absolute-URL base for the webhook payload: explicit env wins (the API may
     # sit behind a proxy whose forwarded headers we can't trust), else what the
@@ -6123,7 +6045,7 @@ async def download_all_clips(job_id: str, request: Request):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"openshorts_clips_{job_id[:8]}.zip",
+        filename=f"clarity_clips_{job_id[:8]}.zip",
         background=BackgroundTask(remove_zip),
     )
 
@@ -6243,9 +6165,6 @@ async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
                 clip['video_url'] = (
                     f"/videos/{job_id}/"
                     f"{_canonical_clip_file(job_dir, base_name, i)}")
-        if any(watermarked.is_marked(c.get("server_file") or "")
-               for c in (proj.state or {}).get("clips", [])):
-            watermarked.mark_job(job_dir)
         jobs[job_id] = {
             'status': 'completed',
             'logs': _TimedLog(["♻️ Project restored from your library."]),
@@ -6317,7 +6236,6 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 from editor import VideoEditor
 from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, CAPTION_PRESETS
 from hooks import add_hook_to_video
-from translate import translate_video, get_supported_languages
 from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
                        generate_youtube_description, extract_face_frames)
 
@@ -6691,7 +6609,7 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         "duration": total,
         "current_file": current_file,
         "has_captions": bool(re.match(r'^subtitled_\d+_',
-                                      watermarked.clean_name(current_file))),
+                                      current_file[3:] if current_file.startswith("wm_") else current_file)),
         "words": words_out,
         "source": {
             "available": bool(source_path),
@@ -7924,115 +7842,6 @@ async def add_hook(req: HookRequest, request: Request):
         "burned_hook": None if req.remove else clip_data['auto_hook'],
     }
 
-class TranslateRequest(BaseModel):
-    job_id: str
-    clip_index: int
-    target_language: str
-    source_language: Optional[str] = None
-    input_filename: Optional[str] = None
-
-@app.get("/api/translate/languages")
-async def get_languages():
-    """Return supported languages for translation."""
-    return {"languages": get_supported_languages()}
-
-@app.post("/api/translate")
-async def translate_clip(
-    req: TranslateRequest,
-    request: Request,
-    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key")
-):
-    """Translate a video clip to a different language using ElevenLabs dubbing."""
-    if not x_elevenlabs_key:
-        raise HTTPException(status_code=400, detail="Missing X-ElevenLabs-Key header")
-
-    await _ensure_job_files(req.job_id, request)
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[req.job_id]
-    await _assert_job_owner(request, job)
-    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
-    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
-
-    if not json_files:
-        raise HTTPException(status_code=404, detail="Metadata not found")
-
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
-
-    clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
-        raise HTTPException(status_code=404, detail="Clip not found")
-
-    clip_data = clips[req.clip_index]
-
-    # Video Path
-    if req.input_filename:
-        filename = os.path.basename(req.input_filename)
-    else:
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-
-    input_path = os.path.join(output_dir, filename)
-    if not os.path.exists(input_path):
-        raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
-
-    # Output video with language suffix
-    base, ext = os.path.splitext(filename)
-    output_filename = f"translated_{req.target_language}_{base}{ext}"
-    output_path = os.path.join(output_dir, output_filename)
-
-    try:
-        # Run translation in thread pool (blocking API calls)
-        def run_translate():
-            return translate_video(
-                video_path=input_path,
-                output_path=output_path,
-                target_language=req.target_language,
-                api_key=x_elevenlabs_key,
-                source_language=req.source_language,
-            )
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, run_translate)
-
-    except Exception as e:
-        print(f"❌ Translation Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # AI Act art. 50(2): the voice in this file was synthesised, so the file
-    # says so in a way a machine can read. Best-effort by design — see
-    # ffmpeg_utils.mark_ai_generated.
-    from ffmpeg_utils import mark_ai_generated
-    await loop.run_in_executor(
-        None, lambda: mark_ai_generated(output_path, "AI voice dubbing"))
-
-    output_filename = await _deliver(request, req.job_id, output_filename)
-
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-
-    # Update Metadata on Disk
-    try:
-        if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-            data['shorts'] = clips
-            write_json_atomic(json_files[0], data, indent=4)
-            print(f"✅ Metadata updated with translated video for clip {req.clip_index}")
-    except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
-
-    _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
-
-    return {
-        "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
-    }
-
 class SocialPostRequest(BaseModel):
     job_id: str
     clip_index: int
@@ -8416,7 +8225,7 @@ async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
         if BILLING_ENABLED:
             # Signed-in free user (or no auth at all): social posting is
             # paid-only in cloud, so there are no posts to measure either.
-            raise payment_required("no_plan", "Social analytics needs an active OpenShorts plan.")
+            raise payment_required("no_plan", "Social analytics needs an active Clarity plan.")
         raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
     if forced_profile:
         user = await _user_from_request(request)
@@ -8487,7 +8296,7 @@ async def social_total_impressions(
     breakdown: Optional[bool] = None,
     user: Optional[str] = None,
 ):
-    """Views of the posts published through OpenShorts in a window.
+    """Views of the posts published through Clarity in a window.
 
     Computed by aggregating the profile-scoped post cache instead of proxying
     Upload-Post's /total-impressions: that endpoint echoes the requested
@@ -8644,17 +8453,15 @@ async def social_cancel_scheduled(job_id: str, request: Request, user: Optional[
 # --- Thumbnail Studio Endpoints ---
 
 def thumbnail_transcribe_minutes(source_minutes) -> int:
-    """Minutes a Thumbnail Studio transcription costs: one per
-    THUMBNAIL_SOURCE_MINUTES_PER_CHARGED minutes of source, never less than the
-    flat TRANSCRIBE_MINUTES a typical video always cost."""
-    from cloud import config as _cfg  # plain constants; importable with billing off
+    """Minutes a Thumbnail Studio transcription costs."""
+    _cfg = _cloud_cfg()
     per = max(1, int(_cfg.THUMBNAIL_SOURCE_MINUTES_PER_CHARGED))
     minutes = max(0.0, float(source_minutes or 0))
     return max(int(_cfg.TRANSCRIBE_MINUTES), int(math.ceil(minutes / per - 1e-9)))
 
 
 def _check_thumbnail_length(minutes):
-    from cloud import config as _cfg
+    _cfg = _cloud_cfg()
     cap = int(_cfg.THUMBNAIL_MAX_SOURCE_MINUTES)
     if cap > 0 and float(minutes) > cap + 0.5:
         raise HTTPException(status_code=413, detail=(
@@ -8679,7 +8486,7 @@ async def _probe_thumbnail_url(request, url, user):
     if balance["remaining"] < 1:
         _maybe_send_quota_email(user)
         raise payment_required(
-            "quota_exceeded", "The user is out of OpenShorts processing minutes for this period.",
+            "quota_exceeded", "The user is out of Clarity processing minutes for this period.",
             minutes_required=1, minutes_remaining=balance["remaining"])
     _check_probe_rate(user.id)
     paid_allowed = not await _paid_proxy_budget_exceeded()
@@ -8991,12 +8798,6 @@ async def thumbnail_analyze(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _cloud_cfg():
-    """cloud.config: plain env-backed constants, importable with billing off."""
-    from cloud import config as _cfg
-    return _cfg
-
-
 def _check_text_length(value, limit, field):
     if value and limit > 0 and len(value) > limit:
         raise HTTPException(status_code=413, detail=(
@@ -9030,7 +8831,7 @@ async def _thumbnail_text_gate(request, session):
             _maybe_send_quota_email(user)
             raise payment_required(
                 "quota_exceeded",
-                "The user is out of OpenShorts minutes; analyze a video to get title suggestions.",
+                "The user is out of Clarity minutes; analyze a video to get title suggestions.",
                 minutes_required=1, minutes_remaining=balance["remaining"])
     times.append(now)
 
@@ -9418,42 +9219,128 @@ async def thumbnail_publish_status(publish_id: str, request: Request):
     return {k: v for k, v in record.items() if k != "user_id"}
 
 
-# @app.get("/api/gallery/clips")
-# async def get_gallery_clips(limit: int = 20, offset: int = 0, refresh: bool = False):
-#     """
-#     Fetch clips from S3 for the gallery with pagination.
-#
-#     Args:
-#         limit: Number of clips to return (default 20, max 100)
-#         offset: Starting position for pagination
-#         refresh: Force refresh cache
-#     """
-#     try:
-#         # Clamp limit to reasonable values
-#         limit = min(max(1, limit), 100)
-#
-#         # Get clips (uses cache internally)
-#         all_clips = list_all_clips(limit=limit + offset, force_refresh=refresh)
-#
-#         # Apply offset for pagination
-#         clips = all_clips[offset:offset + limit]
-#
-#         return {
-#             "clips": clips,
-#             "total": len(all_clips),
-#             "limit": limit,
-#             "offset": offset,
-#             "has_more": len(all_clips) > offset + limit
-#         }
-#     except Exception as e:
-#         print(f"❌ Gallery Error: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
+
+# =========================================================================== #
+# 100% Free AI Voice Dubbing & Video Translation (translate.py)
+# =========================================================================== #
+from translate import get_supported_languages, translate_video
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SaaSShorts: AI UGC Video Generator for SaaS Products
-# ═══════════════════════════════════════════════════════════════════════
+class TranslateRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    target_language: str
+    source_language: Optional[str] = None
+    input_filename: Optional[str] = None
+    voice_gender: str = "female"
 
+
+@app.get("/api/translate/languages")
+@app.get("/api/languages")
+async def get_languages():
+    """Return supported languages for 100% free neural voice dubbing."""
+    return {"languages": get_supported_languages()}
+
+
+@app.post("/api/translate")
+async def translate_clip(req: TranslateRequest, request: Request):
+    """Translate and dub a video clip into 31+ languages using 100% free Edge Neural TTS."""
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    with open(json_files[0], "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    clips = data.get("shorts", [])
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    clip_data = clips[req.clip_index]
+
+    if req.input_filename:
+        filename = os.path.basename(req.input_filename)
+    else:
+        filename = (clip_data.get("video_url") or "").split("/")[-1].split("?")[0]
+        if not filename:
+            base_name = os.path.basename(json_files[0]).replace("_metadata.json", "")
+            filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+
+    input_path = os.path.join(output_dir, filename)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404, detail=f"Video file not found: {filename}")
+
+    base, ext = os.path.splitext(filename)
+    # Strip previous translated_ prefix so re-dubbing into another language stays clean
+    clean_base = re.sub(r"^translated_[a-zA-Z-]+_", "", base)
+    output_filename = f"translated_{req.target_language}_{clean_base}{ext or '.mp4'}"
+    output_path = os.path.join(output_dir, output_filename)
+    gemini_key = await resolve_gemini(request) or ""
+
+    try:
+        def run_translate():
+            return translate_video(
+                video_path=input_path,
+                output_path=output_path,
+                target_language=req.target_language,
+                source_language=req.source_language,
+                transcript=data.get("transcript"),
+                clip_start=float(clip_data.get("start") or 0),
+                clip_end=float(clip_data.get("end") or 0),
+                voice_gender=req.voice_gender or "female",
+                gemini_key=gemini_key,
+            )
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, run_translate)
+    except Exception as e:
+        print(f"❌ Translation Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    from ffmpeg_utils import mark_ai_generated
+    await loop.run_in_executor(
+        None, lambda: mark_ai_generated(output_path, "AI voice dubbing")
+    )
+
+    output_filename = await _deliver(request, req.job_id, output_filename)
+    new_url = f"/videos/{req.job_id}/{output_filename}"
+
+    mem_clips = (job.get("result") or {}).get("clips") or []
+    if req.clip_index < len(mem_clips):
+        mem_clips[req.clip_index]["video_url"] = new_url
+        tx_map = mem_clips[req.clip_index].setdefault("translated_videos", {})
+        tx_map[req.target_language] = new_url
+
+    try:
+        clips[req.clip_index]["video_url"] = new_url
+        tx_map = clips[req.clip_index].setdefault("translated_videos", {})
+        tx_map[req.target_language] = new_url
+        data["shorts"] = clips
+        write_json_atomic(json_files[0], data, indent=4)
+    except Exception as e:
+        print(f"⚠️ Failed to update metadata.json: {e}")
+
+    _archive_clip_edit_bg(req.job_id, req.clip_index, output_filename)
+    return {
+        "success": True,
+        "status": "success",
+        "new_video_url": new_url,
+        "video_url": new_url,
+        "language": req.target_language,
+    }
+
+
+# =========================================================================== #
+# 100% Free AI Shorts & UGC Video Generator (saasshorts.py)
+# =========================================================================== #
 from saasshorts import (
     scrape_website,
     research_saas_online,
@@ -9465,13 +9352,75 @@ from saasshorts import (
     DEFAULT_VOICES,
 )
 
-# State for SaaSShorts jobs (separate from video processing jobs)
 saas_jobs: Dict[str, Dict] = {}
+UGC_GALLERY_DIR = os.path.join(OUTPUT_DIR, "ugc_gallery")
+ACTOR_GALLERY_DIR = os.path.join(OUTPUT_DIR, "actor_gallery")
+
+
+def _save_to_local_ugc_gallery(job_id: str, video_url: str, actor_url: str, metadata: dict) -> dict:
+    os.makedirs(UGC_GALLERY_DIR, exist_ok=True)
+    gallery_file = os.path.join(UGC_GALLERY_DIR, "gallery.json")
+    items = []
+    if os.path.exists(gallery_file):
+        try:
+            with open(gallery_file, "r", encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception:
+            items = []
+    entry = {
+        "id": job_id[:8],
+        "job_id": job_id,
+        "video_url": video_url,
+        "actor_image_url": actor_url,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **metadata,
+    }
+    items = [x for x in items if x.get("job_id") != job_id]
+    items.insert(0, entry)
+    write_json_atomic(gallery_file, items[:100], indent=2)
+    return {"video_id": entry["id"], "video_url": video_url}
+
+
+def _list_local_ugc_gallery(limit: int = 50) -> list:
+    gallery_file = os.path.join(UGC_GALLERY_DIR, "gallery.json")
+    items = []
+    if os.path.exists(gallery_file):
+        try:
+            with open(gallery_file, "r", encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception:
+            items = []
+    seen = {x.get("job_id") for x in items if x.get("job_id")}
+    # Also include any saas_* directories on disk
+    try:
+        for d in sorted(os.listdir(OUTPUT_DIR), reverse=True):
+            if not d.startswith("saas_") or d.startswith("saas_actors_"):
+                continue
+            jid = d[len("saas_"):]
+            if jid in seen:
+                continue
+            full_dir = os.path.join(OUTPUT_DIR, d)
+            if not os.path.isdir(full_dir):
+                continue
+            mp4s = [f for f in os.listdir(full_dir) if f.endswith("_final.mp4")]
+            if mp4s:
+                items.append({
+                    "id": jid[:8],
+                    "job_id": jid,
+                    "title": mp4s[0].replace("_final.mp4", "").replace("_", " ").title(),
+                    "video_url": f"/videos/{d}/{mp4s[0]}",
+                    "style": "ugc",
+                    "language": "en",
+                    "created_at": datetime.fromtimestamp(os.path.getmtime(full_dir), tz=timezone.utc).isoformat(),
+                })
+    except Exception:
+        pass
+    return items[:limit]
 
 
 class SaaSAnalyzeRequest(BaseModel):
     url: Optional[str] = None
-    description: Optional[str] = None  # Manual product/business description
+    description: Optional[str] = None
     num_scripts: int = 3
     style: str = "ugc"
     language: str = "en"
@@ -9479,65 +9428,47 @@ class SaaSAnalyzeRequest(BaseModel):
 
 
 @app.post("/api/saasshorts/analyze")
-async def saasshorts_analyze(
-    req: SaaSAnalyzeRequest,
-    request: Request,
-):
-    """Analyze a URL or manual description and generate video scripts."""
-    gemini_key = await resolve_gemini(request)
-    if not gemini_key:
+async def saasshorts_analyze(req: SaaSAnalyzeRequest, request: Request):
+    """Analyze a URL or manual description and generate viral video scripts (100% free via AI Hub or Gemini)."""
+    gemini_key = await resolve_gemini(request) or ""
+    if not gemini_key and not _local_or_hub_llm_describe():
         raise gemini_missing_error()
 
     if not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
-    max_scripts = _cloud_cfg().SAAS_MAX_SCRIPTS
-    if not 1 <= int(req.num_scripts) <= max_scripts:
-        raise HTTPException(status_code=400,
-                            detail=f"num_scripts must be between 1 and {max_scripts}.")
-    _check_text_length(req.description, _cloud_cfg().SAAS_DESCRIPTION_MAX_CHARS, "description")
-
-    # Meter the managed Gemini research/analysis (no-op for self-host).
-    saas_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, saas_minutes, "saasshorts", "saasshorts_analyze")
+    num_scripts = min(max(1, int(req.num_scripts or 3)), 6)
 
     try:
         loop = asyncio.get_event_loop()
 
         def run_analysis():
             web_research = None
-
             if req.url and req.url.strip():
-                # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
                 web_research = research_saas_online(req.url, gemini_key)
                 analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
             else:
-                # Manual description: build analysis from description
+                desc = (req.description or "").strip()
                 analysis = {
-                    "product_name": req.description.split(",")[0].strip()[:60] if req.description else "Product",
-                    "description": req.description,
-                    "value_proposition": req.description,
+                    "product_name": desc.split(",")[0].strip()[:60] if desc else "Product",
+                    "description": desc,
+                    "value_proposition": desc,
                     "target_audience": "general audience",
-                    "key_features": [req.description],
+                    "key_features": [desc] if desc else ["Fast & easy"],
                     "pain_points": [],
                     "tone": "casual and authentic",
                 }
-
-            scripts = generate_scripts(analysis, gemini_key, req.num_scripts, req.style, req.language, req.actor_gender)
+            scripts = generate_scripts(
+                analysis, gemini_key, num_scripts, req.style, req.language, req.actor_gender
+            )
             return {
                 "analysis": analysis,
                 "scripts": scripts,
                 "web_research": web_research,
             }
 
-        result = await loop.run_in_executor(None, run_analysis)
-        if reservation_id:
-            await _metering.commit_reservation(reservation_id)
-        return result
-
+        return await loop.run_in_executor(None, run_analysis)
     except Exception as e:
-        if reservation_id:
-            await _metering.release_reservation(reservation_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -9548,596 +9479,127 @@ class SaaSActorRequest(BaseModel):
 
 
 @app.post("/api/saasshorts/actor-upload")
+@app.post("/api/saasshorts/upload-actor")
 async def saasshorts_actor_upload(request: Request, file: UploadFile = File(...)):
-    """Upload a custom actor image (stored locally only, not S3)."""
-    # SaaSShorts is part of the paid product — require entitlement in cloud mode
-    # (no-op for self-host) so anonymous callers can't drive server work.
-    await require_managed_entitlement(request)
+    """Upload a custom actor image (stored locally)."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
+    ACTOR_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+    content = await file.read(ACTOR_IMAGE_MAX_BYTES + 1)
+    if len(content) > ACTOR_IMAGE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large (max 25 MB)")
+    if len(content) < 500:
+        raise HTTPException(status_code=400, detail="File too small to be a valid image")
 
-    try:
-        # Bounded read: an actor image has no business being large. Cap it so an
-        # anonymous caller can't stream a multi-GB body into RAM (OOM DoS).
-        ACTOR_IMAGE_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
-        content = await file.read(ACTOR_IMAGE_MAX_BYTES + 1)
-        if len(content) > ACTOR_IMAGE_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Image too large (max 25 MB)")
-
-        # Validate minimum size
-        if len(content) < 1000:
-            raise HTTPException(status_code=400, detail="File too small to be a valid image")
-
-        upload_id = uuid.uuid4().hex[:8]
-        # Its own directory with an owner marker, like generated actors: a
-        # shared "actor_uploads" folder had no owner for /videos to check.
-        dir_name = f"saas_actors_{uuid.uuid4()}"
-        upload_dir = os.path.join(OUTPUT_DIR, dir_name)
-        os.makedirs(upload_dir, exist_ok=True)
-        _write_owner_marker(upload_dir, await _owner_id(request))
-        filename = f"custom_{upload_id}.png"
-        file_path = os.path.join(upload_dir, filename)
-
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        return {"url": f"/videos/{dir_name}/{filename}"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    upload_id = uuid.uuid4().hex[:8]
+    dir_name = f"saas_actors_{uuid.uuid4()}"
+    upload_dir = os.path.join(OUTPUT_DIR, dir_name)
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = f"custom_{upload_id}.png"
+    file_path = os.path.join(upload_dir, filename)
+    with open(file_path, "wb") as f:
+        f.write(content)
+    return {"url": f"/videos/{dir_name}/{filename}"}
 
 
 @app.post("/api/saasshorts/actor-options")
-async def saasshorts_actor_options(
-    req: SaaSActorRequest,
-    request: Request,
-    x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
-):
-    """Generate multiple actor image options for the user to choose from."""
-    await require_managed_entitlement(request)
-    fal_key = x_fal_key
-    if not fal_key:
-        raise HTTPException(status_code=400, detail="Missing fal.ai API Key")
-
+@app.post("/api/saasshorts/generate-actors")
+async def saasshorts_actor_options(req: SaaSActorRequest, request: Request):
+    """Generate presenter portrait options for free using Pollinations Flux + Pillow HD fallback."""
     try:
         job_id = str(uuid.uuid4())
         out_dir = os.path.join(OUTPUT_DIR, f"saas_actors_{job_id}")
         os.makedirs(out_dir, exist_ok=True)
-        _write_owner_marker(out_dir, await _owner_id(request))
 
         loop = asyncio.get_running_loop()
-        import functools
         paths = await loop.run_in_executor(
             None,
             functools.partial(
                 generate_actor_images,
-                req.actor_description, fal_key, out_dir, "actor", req.num_options,
+                req.actor_description,
+                None,
+                out_dir,
+                "actor",
+                min(max(1, int(req.num_options or 3)), 6),
                 product_description=req.product_description,
             ),
         )
-
-        # Upload each actor image to public S3 with description
-        desc = req.actor_description
-        if req.product_description:
-            desc += f" (holding {req.product_description})"
-        urls = []
-        owner_tag = _actor_owner_tag(await _owner_id(request))
-        for p in paths:
-            s3_url = upload_actor_to_s3(p, description=desc, owner_tag=owner_tag)
-            if s3_url:
-                urls.append(s3_url)
-            else:
-                # Fallback to local URL if S3 fails
-                urls.append(f"/videos/saas_actors_{job_id}/{os.path.basename(p)}")
-
+        urls = [f"/videos/saas_actors_{job_id}/{os.path.basename(p)}" for p in paths]
         return {"images": urls}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/saasshorts/gallery")
-async def saasshorts_video_gallery(limit: int = 50):
-    """List all UGC videos from the public gallery."""
-    try:
-        loop = asyncio.get_running_loop()
-        videos = await loop.run_in_executor(None, list_video_gallery, limit)
-        return {"videos": videos, "total": len(videos)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class SaaSPostRequest(BaseModel):
-    job_id: str
-    api_key: Optional[str] = None  # BYOK; ignored for managed users
-    user_id: Optional[str] = None  # BYOK profile; ignored for managed users
-    platforms: List[str]
-    title: Optional[str] = None
-    description: Optional[str] = None
-    scheduled_date: Optional[str] = None
-    timezone: Optional[str] = "UTC"
-
-
-@app.post("/api/saasshorts/post")
-async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
-    """Post an AI Shorts video to social media via Upload-Post."""
-    if req.job_id not in saas_jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
-    if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, req.user_id)
-
-    job = saas_jobs[req.job_id]
-    await _assert_job_owner(request, job)
-    await _check_social_post_rate(request)
-    result = job.get("result")
-    if not result or not result.get("video_url"):
-        raise HTTPException(status_code=400, detail="No video available for this job")
-
-    try:
-        # Resolve video file path
-        video_url = result["video_url"]  # e.g. /videos/saas_xxx/slug_final.mp4
-        rel_path = video_url.replace("/videos/", "")
-        file_path = os.path.join(OUTPUT_DIR, rel_path)
-
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail=f"Video file not found")
-
-        script = result.get("script", {})
-        final_title = req.title or script.get("title", "AI Short")
-        final_description = req.description or script.get("caption", "")
-        if not final_description:
-            final_description = script.get("full_narration", "Check this out!")
-
-        url = "https://api.upload-post.com/api/upload"
-        headers = {"Authorization": f"Apikey {upload_key}"}
-
-        data_payload = {
-            "user": post_user,
-            "title": final_title,
-            "platform[]": req.platforms,
-            "async_upload": "true",
-        }
-
-        if req.scheduled_date:
-            data_payload["scheduled_date"] = req.scheduled_date
-            if req.timezone:
-                data_payload["timezone"] = req.timezone
-
-        if "tiktok" in req.platforms:
-            data_payload["tiktok_title"] = final_description
-            data_payload["post_mode"] = TIKTOK_POST_MODE
-        if "instagram" in req.platforms:
-            data_payload["instagram_title"] = final_description
-            data_payload["media_type"] = "REELS"
-        if "youtube" in req.platforms:
-            data_payload["youtube_title"] = youtube_title(final_title)
-            data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
-
-        filename = os.path.basename(file_path)
-        print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
-        response = await asyncio.to_thread(
-            _post_video_blocking, url, headers, data_payload, file_path, filename, 120.0
-        )
-
-        if response.status_code not in [200, 201, 202]:
-            raise HTTPException(status_code=response.status_code, detail=f"Upload-Post Error: {response.text}")
-
-        return response.json()
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ [AI Shorts] Post Exception: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# The gallery and the per-video pages are rendered by this API service, but the
-# app they advertise lives on www. A relative href on `api.` host resolves
-# against `api.`, where `/` is not the app (it is a 404), so every link that
-# crosses hosts is written absolute. `www.openshorts.app/gallery` and
-# `/video/...` 301 to the api host (dashboard/nginx.conf), so the api host is
-# the final domain for those two and the app host is final for everything else.
-APP_HOST = "https://www.openshorts.app"
-GALLERY_HOST = "https://api.openshorts.app"
-
-
-def _json_ld(payload: dict) -> str:
-    """Serialise a JSON-LD payload for an inline <script> block.
-
-    `html.escape()` is the wrong tool here: inside JSON-LD it produces
-    `&amp;quot;` and friends, which is still valid JSON *text* but no longer
-    means what it said, so the crawler reads a literal entity instead of a
-    quote. The right escaping for this context is JSON's own, plus `<>` and `&`
-    as unicode escapes so a title can never close the script tag.
-    """
-    return (
-        json.dumps(payload, ensure_ascii=False)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
-
-
-# The gallery and per-video pages are user-generated output (scraped product
-# pages, model-written scripts) on the API host. They stay crawlable so their
-# links still count, but are kept out of the index: thin, near-duplicate UGC on
-# a second host only dilutes the site's own pages.
-UGC_ROBOTS = "noindex,follow"
-
-
-def _ugc_html_response(html: str) -> HTMLResponse:
-    return HTMLResponse(content=html, headers={"X-Robots-Tag": "noindex, follow"})
-
-
-@app.get("/gallery", response_class=HTMLResponse)
-async def gallery_html_page():
-    """SEO gallery page with all generated UGC videos."""
-    import html as html_mod
-    loop = asyncio.get_running_loop()
-    videos = await loop.run_in_executor(None, list_video_gallery, 100)
-
-    cards_html = ""
-    ld_items = []
-    for i, v in enumerate(videos):
-        # Two versions of the same string on purpose: the HTML one is escaped
-        # for markup, the JSON-LD one is serialised as JSON. Escaping once and
-        # reusing the result in both places is what produced `&amp;amp;`.
-        raw_title = v.get("title", "Untitled")
-        title = html_mod.escape(raw_title)
-        video_url = html_mod.escape(_http_url_or_empty(v.get("video_url", "")))
-        actor_url = html_mod.escape(_http_url_or_empty(v.get("actor_url", "")))
-        video_id = html_mod.escape(str(v.get("video_id", "")))
-        duration = v.get("duration", 0)
-        mode = v.get("video_mode", "")
-        product = html_mod.escape(v.get("product_name", ""))
-        caption = html_mod.escape(v.get("caption", "")[:120])
-
-        mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>' if mode == "lowcost" else '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
-
-        cards_html += f'''
-        <a href="/video/{video_id}" style="text-decoration:none;color:inherit">
-          <div style="background:#18181b;border-radius:16px;overflow:hidden;border:1px solid #27272a;transition:transform 0.2s" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
-            <div style="position:relative;aspect-ratio:9/16;background:#000">
-              <video src="{video_url}" poster="{actor_url}" muted playsinline preload="metadata"
-                     onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"
-                     style="width:100%;height:100%;object-fit:cover"></video>
-              <div style="position:absolute;top:8px;right:8px">{mode_badge}</div>
-            </div>
-            <div style="padding:12px">
-              <h2 style="font-size:14px;font-weight:600;margin:0 0 4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{title}</h2>
-              <p style="font-size:11px;color:#71717a;margin:0">{duration:.0f}s · {product}</p>
-            </div>
-          </div>
-        </a>'''
-
-        ld_items.append(
-            {
-                "@type": "ListItem",
-                "position": i + 1,
-                # The apex 301s to www, which 301s to here: name the host the
-                # page is actually served from.
-                "url": f"{GALLERY_HOST}/video/{video_id}",
-                "name": raw_title,
-            }
-        )
-
-    ld_json = _json_ld(
-        {
-            "@context": "https://schema.org",
-            "@type": "CollectionPage",
-            "name": "AI UGC Video Gallery",
-            "mainEntity": {
-                "@type": "ItemList",
-                "numberOfItems": len(videos),
-                "itemListElement": ld_items,
-            },
-        }
-    )
-
-    return _ugc_html_response(f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI UGC Video Gallery | OpenShorts</title>
-<meta name="description" content="Browse {len(videos)} AI-generated UGC marketing videos. Create viral TikTok and Instagram Reels for your SaaS product.">
-<meta name="robots" content="{UGC_ROBOTS}">
-<link rel="canonical" href="{GALLERY_HOST}/gallery">
-<meta property="og:title" content="AI UGC Video Gallery | OpenShorts">
-<meta property="og:type" content="website">
-<meta property="og:description" content="Browse AI-generated UGC marketing videos for SaaS products.">
-<script type="application/ld+json">{ld_json}</script>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#0a0a0c;color:#e4e4e7;font-family:-apple-system,BlinkMacSystemFont,sans-serif}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:20px;padding:20px;max-width:1400px;margin:0 auto}}
-nav{{padding:20px 40px;border-bottom:1px solid #27272a;display:flex;align-items:center;justify-content:space-between}}
-h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
-.subtitle{{text-align:center;color:#71717a;font-size:14px;padding:8px 20px 20px}}
-.cta{{display:inline-block;background:#8b5cf6;color:#fff;padding:10px 24px;border-radius:12px;text-decoration:none;font-weight:600;font-size:14px}}
-</style>
-</head>
-<body>
-<nav><strong style="font-size:18px">OpenShorts</strong><a href="{APP_HOST}/" class="cta">Create Your Video</a></nav>
-<h1>AI-Generated UGC Videos</h1>
-<p class="subtitle">{len(videos)} videos generated · Low Cost & Premium modes</p>
-<div class="grid">{cards_html}</div>
-<div style="text-align:center;padding:40px"><a href="{APP_HOST}/" class="cta">Create Your Own UGC Video</a></div>
-</body></html>''')
-
-
-def _http_url_or_empty(value) -> str:
-    """``value`` if it is an http(s) URL, else "" (no javascript:/data:)."""
-    value = str(value or "").strip()
-    return value if re.match(r"(?i)^https?://", value) else ""
-
-
-@app.get("/video/{video_id}", response_class=HTMLResponse)
-async def video_html_page(video_id: str):
-    """SEO individual video page with og:video meta tags."""
-    import html as html_mod
-    loop = asyncio.get_running_loop()
-    videos = await loop.run_in_executor(None, list_video_gallery, 200)
-    meta = next((v for v in videos if v.get("video_id") == video_id), None)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    # Raw values feed the JSON-LD (serialised as JSON by _json_ld) while the
-    # escaped ones feed the markup; they are not interchangeable.
-    raw_title = meta.get("title", "Untitled")
-    raw_caption = meta.get("caption", "")
-    title = html_mod.escape(raw_title)
-    caption = html_mod.escape(raw_caption)
-    narration = html_mod.escape(meta.get("full_narration", ""))
-    # Everything below lands in markup, generated from user input (product
-    # page scrape, Gemini output): escape it all, and only let http(s) URLs
-    # into src/href/content so a javascript: URL cannot ride along either.
-    raw_video_url = _http_url_or_empty(meta.get("video_url", ""))
-    raw_actor_url = _http_url_or_empty(meta.get("actor_url", ""))
-    video_url = html_mod.escape(raw_video_url)
-    actor_url = html_mod.escape(raw_actor_url)
-    duration = meta.get("duration", 0)
-    mode = meta.get("video_mode", "")
-    product = html_mod.escape(meta.get("product_name", ""))
-    product_url = html_mod.escape(_http_url_or_empty(meta.get("product_url", "")))
-    raw_language = str(meta.get("language", "en") or "en")
-    language = raw_language if re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", raw_language) else "en"
-    hashtags = html_mod.escape(" ".join(str(h) for h in (meta.get("hashtags") or [])))
-    cost = meta.get("cost_estimate", {}).get("total", 0)
-    created = meta.get("created_at", "")
-    actor_desc = html_mod.escape(meta.get("actor_description", ""))
-
-    ld_json = _json_ld(
-        {
-            "@context": "https://schema.org",
-            "@type": "VideoObject",
-            "name": raw_title,
-            "description": raw_caption,
-            "thumbnailUrl": raw_actor_url,
-            "contentUrl": raw_video_url,
-            "uploadDate": created,
-            "duration": f"PT{int(duration)}S",
-            "width": 1080,
-            "height": 1920,
-            "inLanguage": language,
-        }
-    )
-
-    mode_label = "Low Cost" if mode == "lowcost" else "Premium"
-
-    return _ugc_html_response(f'''<!DOCTYPE html>
-<html lang="{language}">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} - AI UGC Video | OpenShorts</title>
-<meta name="description" content="{caption} {hashtags}">
-<meta name="robots" content="{UGC_ROBOTS}">
-<link rel="canonical" href="{GALLERY_HOST}/video/{video_id}">
-<meta property="og:type" content="video.other">
-<meta property="og:title" content="{title}">
-<meta property="og:description" content="{caption}">
-<meta property="og:video" content="{video_url}">
-<meta property="og:video:type" content="video/mp4">
-<meta property="og:video:width" content="1080">
-<meta property="og:video:height" content="1920">
-<meta property="og:image" content="{actor_url}">
-<meta name="twitter:card" content="player">
-<meta name="twitter:title" content="{title}">
-<meta name="twitter:image" content="{actor_url}">
-<script type="application/ld+json">{ld_json}</script>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#0a0a0c;color:#e4e4e7;font-family:-apple-system,BlinkMacSystemFont,sans-serif}}
-nav{{padding:20px 40px;border-bottom:1px solid #27272a;display:flex;align-items:center;gap:16px}}
-nav a{{color:#a1a1aa;text-decoration:none;font-size:14px}}
-.container{{max-width:1000px;margin:0 auto;padding:40px 20px;display:grid;grid-template-columns:1fr 1fr;gap:40px}}
-@media(max-width:768px){{.container{{grid-template-columns:1fr}}}}
-video{{width:100%;border-radius:16px;background:#000}}
-h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
-.meta{{color:#71717a;font-size:13px;margin-bottom:20px}}
-.section{{margin-bottom:20px}}
-.section h2{{font-size:13px;color:#71717a;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}}
-.section p{{font-size:14px;line-height:1.6}}
-.badge{{display:inline-block;padding:3px 10px;border-radius:9999px;font-size:11px;font-weight:700}}
-.cta{{display:inline-block;background:#8b5cf6;color:#fff;padding:10px 24px;border-radius:12px;text-decoration:none;font-weight:600;font-size:14px;margin-top:20px}}
-</style>
-</head>
-<body>
-<nav><strong>OpenShorts</strong><a href="{GALLERY_HOST}/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
-<div class="container">
-<div><video src="{video_url}" poster="{actor_url}" controls autoplay playsinline style="aspect-ratio:9/16;object-fit:cover"></video></div>
-<div>
-<h1>{title}</h1>
-<p class="meta">{duration:.0f}s · {mode_label} · ${cost:.2f} · {product}</p>
-<div class="section"><h2>Caption</h2><p>{caption}</p><p style="color:#8b5cf6;margin-top:4px">{hashtags}</p></div>
-<div class="section"><h2>Script</h2><p>{narration}</p></div>
-<div class="section"><h2>Actor</h2><p>{actor_desc}</p></div>
-{f'<div class="section"><h2>Product</h2><p><a href="{product_url}" style="color:#8b5cf6" target="_blank">{product}</a></p></div>' if product_url else ''}
-<a href="{GALLERY_HOST}/gallery">← Back to Gallery</a>
-<br><a href="{APP_HOST}/" class="cta">Create Your Own</a>
-</div>
-</div>
-</body></html>''')
-
-
-def _actor_owner_tag(user_id) -> Optional[str]:
-    """Opaque per-user folder name for private actor images (no user id in
-    the bucket). None off cloud, where actors stay in the shared gallery."""
-    secret = _media_secret()
-    if not secret or user_id is None:
-        return None
-    return hmac.new(secret.encode(), f"actor:{user_id}".encode(),
-                    hashlib.sha256).hexdigest()[:24]
 
 
 @app.get("/api/saasshorts/actor-gallery")
-async def saasshorts_actor_gallery(request: Request):
-    """The shared actor gallery, plus the signed-in caller's own actors."""
+async def saasshorts_actor_gallery():
+    """List locally generated or uploaded presenter portraits."""
+    images = []
     try:
-        owner_tag = _actor_owner_tag(await _owner_id(request))
-        loop = asyncio.get_running_loop()
-        images = await loop.run_in_executor(None, list_actor_gallery, owner_tag)
-        return {"images": images}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if os.path.isdir(OUTPUT_DIR):
+            for d in sorted(os.listdir(OUTPUT_DIR), reverse=True):
+                if not d.startswith("saas_actors_"):
+                    continue
+                full_dir = os.path.join(OUTPUT_DIR, d)
+                if not os.path.isdir(full_dir):
+                    continue
+                for fname in sorted(os.listdir(full_dir)):
+                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                        images.append({
+                            "url": f"/videos/{d}/{fname}",
+                            "description": "AI Presenter Portrait",
+                            "mine": True,
+                        })
+                if len(images) >= 36:
+                    break
+    except Exception:
+        pass
+    return {"images": images}
+
+
+@app.get("/api/saasshorts/gallery")
+@app.get("/api/ugc-gallery")
+async def saasshorts_video_gallery(limit: int = 50):
+    """List all generated AI Shorts / UGC videos from the local gallery."""
+    videos = _list_local_ugc_gallery(limit)
+    return {"videos": videos, "total": len(videos)}
 
 
 class SaaSGenerateRequest(BaseModel):
     script: dict
     voice_id: Optional[str] = None
     actor_description: Optional[str] = None
-    selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
+    selected_actor_url: Optional[str] = None
     retry_job_id: Optional[str] = None
-    video_mode: str = "lowcost"  # "lowcost" or "premium"
-    # Publishing to the public /gallery is opt-in: generated videos carry the
-    # user's product name, URL and full script.
-    share_to_gallery: bool = False
+    video_mode: str = "lowcost"
+    share_to_gallery: bool = True
 
 
 @app.post("/api/saasshorts/generate")
-async def saasshorts_generate(
-    req: SaaSGenerateRequest,
-    request: Request,
-    x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
-    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
-):
-    """Generate a SaaS UGC video from a script. Returns a job_id for polling."""
-    await require_managed_entitlement(request)
-    fal_key = x_fal_key
-    elevenlabs_key = x_elevenlabs_key
+async def saasshorts_generate(req: SaaSGenerateRequest, request: Request):
+    """Generate a complete AI Short / UGC video for free ($0.00 cost, no paid API keys required)."""
+    job_id = str(uuid.uuid4())
+    if req.retry_job_id and _is_uuid_id(req.retry_job_id):
+        job_id = req.retry_job_id
+    job_output_dir = os.path.join(OUTPUT_DIR, f"saas_{job_id}")
+    os.makedirs(job_output_dir, exist_ok=True)
 
-    if not fal_key:
-        raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
-    if not elevenlabs_key:
-        raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+    saas_jobs[job_id] = {
+        "user_id": await _owner_id(request),
+        "status": "processing",
+        "logs": _TimedLog(["🚀 Starting 100% Free AI Shorts generation ($0.00 cost)..."]),
+        "result": None,
+        "output_dir": job_output_dir,
+    }
 
-    # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
-    reused = False
-    if req.retry_job_id:
-        # Retry ids are the uuid4 this endpoint minted. Anything else ("x/../thumbnails")
-        # would resolve to a shared folder with no .owner and hand it to the caller.
-        if not _is_uuid_id(req.retry_job_id):
-            raise HTTPException(status_code=400, detail="Invalid retry_job_id")
-        # Check memory first, then disk. _safe_under() blocks a crafted
-        # retry_job_id like "../../tmp/x" from escaping OUTPUT_DIR (the listdir
-        # below deletes files and the pipeline writes here). A known in-memory
-        # job keeps its trusted stored path.
-        if req.retry_job_id in saas_jobs:
-            await _assert_job_owner(request, saas_jobs[req.retry_job_id])
-            old_dir = saas_jobs[req.retry_job_id]["output_dir"]
-        else:
-            old_dir = _safe_under(OUTPUT_DIR, f"saas_{req.retry_job_id}")
-            # After a restart only the marker remembers whose directory it is.
-            disk_owner = _read_owner_marker(old_dir) if old_dir else None
-            if BILLING_ENABLED and disk_owner is not None:
-                caller = await _owner_id(request)
-                if caller is None or str(caller) != disk_owner:
-                    raise HTTPException(status_code=404, detail="Not found")
-
-        if old_dir and os.path.isdir(old_dir):
-            job_id = req.retry_job_id
-            job_output_dir = old_dir
-            reused = True
-            # Clear the 0-byte final video so pipeline re-generates it
-            for f in os.listdir(old_dir):
-                fp = os.path.join(old_dir, f)
-                if f.endswith("_final.mp4") and os.path.getsize(fp) == 0:
-                    os.remove(fp)
-            saas_jobs[job_id] = {
-                "user_id": await _owner_id(request),
-                "status": "processing",
-                "logs": _TimedLog([f"Retrying job {job_id[:8]}... reusing cached assets from disk."]),
-                "result": None,
-                "output_dir": job_output_dir,
-            }
-            _write_owner_marker(job_output_dir, saas_jobs[job_id]["user_id"])
-
-    if not reused:
-        job_id = str(uuid.uuid4())
-        job_output_dir = os.path.join(OUTPUT_DIR, f"saas_{job_id}")
-        os.makedirs(job_output_dir, exist_ok=True)
-        saas_jobs[job_id] = {
-            "user_id": await _owner_id(request),
-            "status": "processing",
-            "logs": _TimedLog(["SaaSShorts job started."]),
-            "result": None,
-            "output_dir": job_output_dir,
-        }
-        _write_owner_marker(job_output_dir, saas_jobs[job_id]["user_id"])
-
-    # If user selected a pre-generated actor, resolve it to a local path
     selected_actor_path = None
-    if req.selected_actor_url:
-        if req.selected_actor_url.startswith("http"):
-            # Download from S3 public URL to job output dir
-            import httpx
-            from security_utils import assert_public_url
-            actor_local = os.path.join(job_output_dir, "selected_actor.png")
-
-            def _fetch_actor():
-                # SSRF guard: block private / metadata hosts before fetching.
-                import ssrf_guard
-                safe_actor_url = assert_public_url(req.selected_actor_url)
-                with ssrf_guard.guarded(), httpx.Client(timeout=30.0) as client:
-                    resp = client.get(safe_actor_url)
-                if resp.status_code != 200:
-                    return None
-                with open(actor_local, "wb") as f:
-                    f.write(resp.content)
-                return actor_local
-
-            try:
-                # Off the event loop: DNS check + a download of up to 30 s.
-                selected_actor_path = await asyncio.to_thread(_fetch_actor)
-            except Exception:
-                pass
-        else:
-            # Sanitize against traversal — the client controls selected_actor_url.
-            rel_actor = req.selected_actor_url.split("?", 1)[0].replace("/videos/", "").lstrip("/")
-            src = _safe_under(OUTPUT_DIR, rel_actor)
-            if src and BILLING_ENABLED:
-                # Only the caller's own files. The shared pre-marker folder of
-                # custom uploads has no owner to check and is let through.
-                segment = rel_actor.split("/", 1)[0]
-                owner = await _media_owner("videos", segment)
-                caller = saas_jobs.get(job_id, {}).get("user_id")
-                if owner is None:
-                    if segment != "actor_uploads":
-                        src = None
-                elif caller is None or str(caller) != owner:
-                    src = None
-            if src and os.path.exists(src):
-                selected_actor_path = src
+    if req.selected_actor_url and not req.selected_actor_url.startswith("http"):
+        rel_actor = req.selected_actor_url.split("?", 1)[0].replace("/videos/", "").lstrip("/")
+        src = _safe_under(OUTPUT_DIR, rel_actor)
+        if src and os.path.exists(src):
+            selected_actor_path = src
 
     config = {
-        "fal_key": fal_key,
-        "elevenlabs_key": elevenlabs_key,
-        "voice_id": req.voice_id or "21m00Tcm4TlvDq8ikWAM",
+        "voice_id": req.voice_id or "en-US-AriaNeural",
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
@@ -10149,61 +9611,50 @@ async def saasshorts_generate(
             loop = asyncio.get_running_loop()
 
             def log_msg(msg):
-                print(f"[SaaSShorts Job {job_id[:8]}] {msg}")
+                print(f"[AI Shorts {job_id[:8]}] {msg}")
                 if job_id in saas_jobs:
                     saas_jobs[job_id]["logs"].append(msg)
 
-            def run():
-                return generate_full_video(req.script, config, job_output_dir, log_msg)
-
-            result = await loop.run_in_executor(None, run)
-
+            result = await loop.run_in_executor(
+                None, lambda: generate_full_video(req.script, config, job_output_dir, log_msg)
+            )
             if job_id in saas_jobs:
                 video_filename = result["video_filename"]
+                video_url = f"/videos/saas_{job_id}/{video_filename}"
+                actor_rel = ""
+                if result.get("actor_image") and os.path.exists(result["actor_image"]):
+                    actor_rel = f"/videos/saas_{job_id}/{os.path.basename(result['actor_image'])}"
                 saas_jobs[job_id]["status"] = "completed"
                 saas_jobs[job_id]["result"] = {
-                    "video_url": f"/videos/saas_{job_id}/{video_filename}",
+                    "video_url": video_url,
                     "video_filename": video_filename,
                     "duration": result.get("duration", 0),
-                    "cost_estimate": result.get("cost_estimate", {}),
+                    "cost_estimate": result.get("cost_estimate", {"total": 0.0}),
                     "script": req.script,
                 }
-                saas_jobs[job_id]["logs"].append("Video generation completed!")
-
-                # Upload to public gallery — opt-in only: the metadata carries
-                # the user's product name, URL and full script.
-                if req.share_to_gallery:
-                    try:
-                        gallery_meta = {
-                            "title": req.script.get("title", "Untitled"),
-                            "hook_text": req.script.get("hook_text", ""),
-                            "caption": req.script.get("caption", ""),
-                            "hashtags": req.script.get("hashtags", []),
-                            "full_narration": req.script.get("full_narration", ""),
-                            "actor_description": req.script.get("actor_description", ""),
-                            "style": req.script.get("style", "ugc"),
-                            "language": req.script.get("language", "en"),
-                            "duration": result.get("duration", 0),
-                            "video_mode": req.video_mode,
-                            "product_name": req.script.get("_product_name", ""),
-                            "product_url": req.script.get("_product_url", ""),
-                            "segments": req.script.get("segments", []),
-                            "cost_estimate": result.get("cost_estimate", {}),
-                        }
-                        gallery_result = upload_video_to_gallery(
-                            video_path=result["video_path"],
-                            actor_image_path=result.get("actor_image", ""),
-                            metadata=gallery_meta,
-                            video_id=job_id[:8],
-                        )
-                        if gallery_result:
-                            saas_jobs[job_id]["result"]["gallery_video_id"] = gallery_result["video_id"]
-                            log_msg("📤 Uploaded to public gallery.")
-                    except Exception as gallery_err:
-                        log_msg(f"⚠️ Gallery upload skipped: {gallery_err}")
-
+                saas_jobs[job_id]["logs"].append("✅ Video generation completed ($0.00)!")
+                try:
+                    gallery_meta = {
+                        "title": req.script.get("title", "AI Short"),
+                        "hook_text": req.script.get("hook_text", ""),
+                        "caption": req.script.get("caption", ""),
+                        "hashtags": req.script.get("hashtags", []),
+                        "full_narration": req.script.get("full_narration", ""),
+                        "actor_description": req.script.get("actor_description", ""),
+                        "style": req.script.get("style", "ugc"),
+                        "language": req.script.get("language", "en"),
+                        "duration": result.get("duration", 0),
+                        "video_mode": req.video_mode,
+                        "product_name": req.script.get("_product_name", ""),
+                        "product_url": req.script.get("_product_url", ""),
+                        "segments": req.script.get("segments", []),
+                        "cost_estimate": result.get("cost_estimate", {"total": 0.0}),
+                    }
+                    _save_to_local_ugc_gallery(job_id, video_url, actor_rel, gallery_meta)
+                except Exception as ge:
+                    print(f"⚠️ Local gallery save warning: {ge}")
         except Exception as e:
-            print(f"[SaaSShorts] ❌ Job {job_id} failed: {e}")
+            print(f"[AI Shorts] ❌ Job {job_id} failed: {e}")
             if job_id in saas_jobs:
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
@@ -10211,46 +9662,753 @@ async def saasshorts_generate(
             concurrency_semaphore.release()
 
     asyncio.create_task(run_generation())
-
     return {"job_id": job_id, "status": "processing"}
 
 
 @app.get("/api/saasshorts/status/{job_id}")
 async def saasshorts_status(job_id: str, request: Request):
-    """Poll SaaSShorts job status."""
+    """Poll AI Shorts job status."""
     if job_id not in saas_jobs:
-        raise HTTPException(status_code=404, detail="SaaSShorts job not found")
-
+        raise HTTPException(status_code=404, detail="AI Shorts job not found")
     job = saas_jobs[job_id]
-    await _assert_job_owner(request, job)
     return {
         "status": job["status"],
-        "logs": job["logs"],
+        "logs": list(job["logs"]),
         "result": job.get("result"),
     }
 
 
 @app.get("/api/saasshorts/voices")
-async def saasshorts_voices(
-    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
-):
-    """List available ElevenLabs voices."""
-    if x_elevenlabs_key:
-        try:
-            loop = asyncio.get_event_loop()
-            voices = await loop.run_in_executor(
-                None, get_elevenlabs_voices, x_elevenlabs_key
-            )
-            if voices:
-                return {"voices": voices, "source": "elevenlabs"}
-        except Exception:
-            pass
-
-    # Fallback to default voices
+async def saasshorts_voices():
+    """List free neural voices from Microsoft Edge TTS (no API key required)."""
     return {
-        "voices": [
-            {"voice_id": vid, "name": name, "category": "default"}
-            for name, vid in DEFAULT_VOICES.items()
-        ],
-        "source": "defaults",
+        "voices": get_elevenlabs_voices(),
+        "source": "edge-tts-free",
     }
+
+
+# =========================================================================== #
+# Local Project & Clip History Library (AutoShorts style, 100% Local Disk)
+# =========================================================================== #
+def _scan_local_projects() -> list:
+    projects = []
+    if not os.path.isdir(OUTPUT_DIR):
+        return projects
+    thumbs_name = os.path.basename(THUMBNAILS_DIR)
+    skip_dirs = {thumbs_name, "ugc_gallery", "actor_gallery", "live_sessions"}
+    for entry in os.listdir(OUTPUT_DIR):
+        if entry in skip_dirs or entry.startswith("saas_"):
+            continue
+        job_dir = os.path.join(OUTPUT_DIR, entry)
+        if not os.path.isdir(job_dir):
+            continue
+        meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+        if not meta_files:
+            continue
+        try:
+            with open(meta_files[0], "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        base_name = os.path.basename(meta_files[0]).replace("_metadata.json", "")
+        custom_title = data.get("project_title") or base_name.replace("_", " ").strip() or f"Project {entry[:8]}"
+        created_ts = os.path.getmtime(meta_files[0])
+        shorts = data.get("shorts") or []
+        clips_out = []
+        for idx, c in enumerate(shorts):
+            vurl = c.get("video_url") or ""
+            fname = vurl.split("/")[-1].split("?")[0] if vurl else f"{base_name}_clip_{idx + 1}.mp4"
+            fpath = os.path.join(job_dir, fname)
+            if not os.path.exists(fpath):
+                # Fallback to canonical clip file if present
+                alt = f"{base_name}_clip_{idx + 1}.mp4"
+                if os.path.exists(os.path.join(job_dir, alt)):
+                    fname = alt
+                    vurl = f"/videos/{entry}/{alt}"
+                else:
+                    continue
+            if not vurl:
+                vurl = f"/videos/{entry}/{fname}"
+            start_s = float(c.get("start") or 0)
+            end_s = float(c.get("end") or 0)
+            clips_out.append({
+                "clip_index": idx,
+                "title": c.get("video_title_for_youtube_short") or c.get("title") or f"Clip #{idx + 1}",
+                "video_url": vurl,
+                "viral_hook_text": c.get("viral_hook_text") or "",
+                "video_description_for_tiktok": c.get("video_description_for_tiktok") or "",
+                "video_description_for_instagram": c.get("video_description_for_instagram") or "",
+                "video_title_for_youtube_short": c.get("video_title_for_youtube_short") or f"Clip #{idx + 1}",
+                "start": start_s,
+                "end": end_s,
+                "duration": round(max(0.0, end_s - start_s), 1),
+                "predicted_score": c.get("predicted_score"),
+                "translated_videos": c.get("translated_videos") or {},
+            })
+        if not clips_out:
+            continue
+        projects.append({
+            "job_id": entry,
+            "title": custom_title,
+            "source_url": data.get("source_url") or "",
+            "language": (data.get("transcript") or {}).get("language", "en"),
+            "created_at": datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat(),
+            "timestamp": created_ts,
+            "clip_count": len(clips_out),
+            "clips": clips_out,
+        })
+    projects.sort(key=lambda p: p.get("timestamp", 0), reverse=True)
+    return projects
+
+
+@app.get("/api/history")
+@app.get("/api/projects")
+async def list_local_history():
+    """Return all locally generated projects and clips from outputs/ (no cloud R2 needed)."""
+    loop = asyncio.get_running_loop()
+    projects = await loop.run_in_executor(None, _scan_local_projects)
+    all_clips = []
+    for p in projects:
+        for c in p["clips"]:
+            all_clips.append({
+                **c,
+                "job_id": p["job_id"],
+                "project_title": p["title"],
+                "created_at": p["created_at"],
+            })
+    return {"projects": projects, "clips": all_clips, "total": len(projects)}
+
+
+class ProjectRenameRequest(BaseModel):
+    title: str
+
+
+@app.patch("/api/projects/{job_id}")
+async def rename_local_project(job_id: str, req: ProjectRenameRequest):
+    """Rename a local project in its metadata JSON (ported from AutoShorts)."""
+    job_dir = _safe_under(OUTPUT_DIR, job_id)
+    if not job_dir or not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Project not found")
+    meta_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    if not meta_files:
+        raise HTTPException(status_code=404, detail="Project metadata not found")
+    new_title = (req.title or "").strip()[:120]
+    if not new_title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    with open(meta_files[0], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["project_title"] = new_title
+    write_json_atomic(meta_files[0], data, indent=2)
+    return {"success": True, "job_id": job_id, "title": new_title}
+
+
+@app.delete("/api/projects/{job_id}")
+async def delete_local_project(job_id: str):
+    """Delete a local project folder from disk (ported from AutoShorts)."""
+    job_dir = _safe_under(OUTPUT_DIR, job_id)
+    if not job_dir or not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Project not found")
+    shutil.rmtree(job_dir, ignore_errors=True)
+    jobs.pop(job_id, None)
+    return {"success": True, "deleted": job_id}
+
+
+# =========================================================================== #
+# Free Channel Autopilot, Creator Workspaces & Live Stream Clipper (PeakCut)
+# =========================================================================== #
+import live_clipper
+
+
+class AutopilotConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    channel_url: Optional[str] = None
+    creator_id: Optional[str] = None
+    check_interval_minutes: Optional[int] = None
+    max_clips_per_video: Optional[int] = None
+    clip_min_seconds: Optional[int] = None
+    clip_max_seconds: Optional[int] = None
+    output_format: Optional[str] = None
+    auto_hook: Optional[bool] = None
+
+
+@app.get("/api/autopilot")
+async def get_autopilot_state():
+    """Return free local Channel Autopilot configuration and live stream sessions."""
+    cfg = live_clipper.load_autopilot_config()
+    sessions = live_clipper.list_live_sessions()
+    creators = live_clipper.list_creators()
+    return {
+        "config": cfg,
+        "live_sessions": sessions,
+        "creators": creators,
+    }
+
+
+@app.put("/api/autopilot")
+async def update_autopilot_state(req: AutopilotConfigRequest):
+    """Save free local Channel Autopilot settings."""
+    payload = {k: v for k, v in req.model_dump().items() if v is not None}
+    updated = live_clipper.save_autopilot_config(payload)
+    return {"config": updated}
+
+
+@app.get("/api/autopilot/videos")
+async def fetch_autopilot_channel_videos(url: Optional[str] = None, limit: int = 8):
+    """Fetch recent videos from any YouTube, Twitch, or Kick channel via yt-dlp."""
+    target_url = (url or "").strip()
+    if not target_url:
+        cfg = live_clipper.load_autopilot_config()
+        target_url = (cfg.get("channel_url") or "").strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Provide a channel URL first")
+    loop = asyncio.get_running_loop()
+    videos = await loop.run_in_executor(
+        None, lambda: live_clipper.fetch_channel_videos(target_url, min(max(1, limit), 20))
+    )
+    return {"channel_url": target_url, "videos": videos}
+
+
+class AutopilotRunRequest(BaseModel):
+    video_url: Optional[str] = None
+
+
+@app.post("/api/autopilot/run")
+async def run_autopilot_now(req: AutopilotRunRequest, request: Request):
+    """Start a real clipping job for a channel video (or latest unclipped video)."""
+    cfg = live_clipper.load_autopilot_config()
+    video_url = (req.video_url or "").strip()
+    if not video_url:
+        ch_url = (cfg.get("channel_url") or "").strip()
+        if not ch_url:
+            raise HTTPException(status_code=400, detail="Set a channel URL or pass video_url")
+        loop = asyncio.get_running_loop()
+        vids = await loop.run_in_executor(None, lambda: live_clipper.fetch_channel_videos(ch_url, 6))
+        if not vids:
+            raise HTTPException(status_code=404, detail="No videos found on this channel")
+        processed = set(cfg.get("processed_videos") or [])
+        chosen = next((v for v in vids if v["id"] not in processed and v.get("url")), vids[0])
+        video_url = chosen["url"]
+        processed.add(chosen["id"])
+        live_clipper.save_autopilot_config({"processed_videos": list(processed)})
+
+    # Reuse process_endpoint to enqueue the video into Clarity's main clipping pipeline
+    res = await process_endpoint(
+        request=request,
+        file=None,
+        url=video_url,
+        acknowledged="true",
+        output_format=cfg.get("output_format", "vertical"),
+        layouts="auto",
+        force_low_quality="true",
+        target_clips=str(cfg.get("max_clips_per_video", 5)),
+        clip_min_seconds=str(cfg.get("clip_min_seconds", 15)),
+        clip_max_seconds=str(cfg.get("clip_max_seconds", 60)),
+        auto_hook="true" if cfg.get("auto_hook", True) else "false",
+    )
+    if isinstance(res, dict) and res.get("job_id"):
+        history = list(cfg.get("recent_jobs") or [])
+        history.insert(0, {
+            "job_id": res["job_id"],
+            "video_url": video_url,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+        live_clipper.save_autopilot_config({"recent_jobs": history[:25]})
+    return res
+
+
+@app.get("/api/creators")
+async def api_list_creators():
+    return {"creators": live_clipper.list_creators()}
+
+
+@app.post("/api/creators")
+async def api_create_creator(request: Request):
+    body = await request.json()
+    try:
+        return live_clipper.create_creator(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/creators/{cid}")
+async def api_update_creator(cid: str, request: Request):
+    body = await request.json()
+    updated = live_clipper.update_creator(cid, body)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    return updated
+
+
+@app.delete("/api/creators/{cid}")
+async def api_delete_creator(cid: str):
+    if not live_clipper.delete_creator(cid):
+        raise HTTPException(status_code=404, detail="Creator not found")
+    return {"deleted": cid}
+
+
+class LiveStartRequest(BaseModel):
+    url: str
+    creator_id: str = ""
+    trigger_phrases: Optional[List[str]] = None
+    window_sec: int = 45
+    cooldown_sec: int = 30
+    loudness_spike: bool = True
+    loudness_db: float = 8.0
+    chat_spike: bool = True
+    chat_mult: float = 3.0
+
+
+@app.get("/api/live/sessions")
+async def api_list_live_sessions():
+    return {"sessions": live_clipper.list_live_sessions()}
+
+
+@app.post("/api/live/start")
+async def api_start_live_session(req: LiveStartRequest):
+    if not (req.url or "").strip():
+        raise HTTPException(status_code=400, detail="Live stream URL is required")
+    return live_clipper.start_live_session(req.model_dump())
+
+
+@app.post("/api/live/stop/{session_id}")
+async def api_stop_live_session(session_id: str):
+    res = live_clipper.stop_live_session(session_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Live session not found")
+    return res
+
+
+class LiveClipNowRequest(BaseModel):
+    seconds: float = 30.0
+
+
+@app.post("/api/live/clip-now/{session_id}")
+async def api_clip_live_now(session_id: str, req: LiveClipNowRequest):
+    loop = asyncio.get_running_loop()
+    clip = await loop.run_in_executor(
+        None, lambda: live_clipper.clip_live_now(session_id, req.seconds)
+    )
+    if not clip:
+        raise HTTPException(
+            status_code=400,
+            detail="Live buffer does not have enough recorded segments yet (wait ~12 seconds after starting).",
+        )
+    return {"success": True, "clip": clip}
+
+
+# =========================================================================== #
+# Multi-AI Provider Hub, Local Ollama Manager, Caption Fixer & Copyright Check
+# (Ported from PeakCut + AutoShorts)
+# =========================================================================== #
+import ai_hub
+from roman import romanize_words
+
+
+@app.get("/api/ai/settings")
+async def api_get_ai_settings(request: Request):
+    gemini_key = await resolve_gemini(request) or ""
+    return {
+        "settings": ai_hub.current_settings(gemini_key),
+        "providers": ai_hub.PROVIDERS,
+    }
+
+
+@app.post("/api/ai/settings")
+async def api_save_ai_settings(request: Request):
+    body = await request.json()
+    saved = ai_hub.save_settings(body if isinstance(body, dict) else {})
+    return {"settings": saved, "providers": ai_hub.PROVIDERS}
+
+
+@app.post("/api/ai/models")
+async def api_list_ai_models(request: Request):
+    body = await request.json()
+    provider = str(body.get("provider") or "gemini")
+    api_key = str(body.get("api_key") or "")
+    base_url = str(body.get("base_url") or "")
+    loop = asyncio.get_running_loop()
+    models = await loop.run_in_executor(
+        None, lambda: ai_hub.list_models(provider, api_key, base_url)
+    )
+    return {"models": models}
+
+
+@app.post("/api/ai/test")
+async def api_test_ai_connection(request: Request):
+    body = await request.json()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: ai_hub.test_connection(body if isinstance(body, dict) else {})
+    )
+
+
+@app.get("/api/ai/usage")
+async def api_get_ai_usage():
+    return ai_hub.get_usage_summary()
+
+
+@app.post("/api/ai/usage/clear")
+async def api_clear_ai_usage():
+    ai_hub.clear_usage()
+    return {"cleared": True}
+
+
+@app.get("/api/ai/environment")
+async def api_get_environment_status():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, ai_hub.get_environment_status)
+
+
+class OllamaPullRequest(BaseModel):
+    model: str = "llama3.1:8b"
+    base_url: str = ""
+
+
+@app.post("/api/ai/ollama/pull")
+async def api_pull_ollama_model(req: OllamaPullRequest):
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(
+        None, lambda: ai_hub.pull_ollama_model(req.model, req.base_url)
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Failed to pull Ollama model"))
+    return res
+
+
+class CopyrightCheckRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/youtube/copyright-check")
+async def api_check_youtube_copyright(req: CopyrightCheckRequest):
+    if not (req.url or "").strip():
+        raise HTTPException(status_code=400, detail="Provide a video URL")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: ai_hub.check_youtube_copyright(req.url.strip())
+    )
+
+
+class FixCaptionsRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    romanize: bool = False
+    preset: Optional[str] = "tiktok"
+
+
+@app.post("/api/clip/fix-captions")
+async def api_fix_clip_captions(req: FixCaptionsRequest, request: Request):
+    """Fix speech-to-text errors in a clip's captions using AI Hub + optional Hinglish Romanizer (PeakCut)."""
+    tx_resp = await get_clip_transcript(req.job_id, req.clip_index, request)
+    words = tx_resp.get("captions") or []
+    if not words:
+        raise HTTPException(status_code=400, detail="No caption words found for this clip")
+
+    gemini_key = await resolve_gemini(request) or ""
+    loop = asyncio.get_running_loop()
+    fixed_words = await loop.run_in_executor(
+        None,
+        lambda: ai_hub.fix_caption_words(words, romanize=req.romanize, override_gemini_key=gemini_key),
+    )
+
+    word_models = [
+        CaptionWordIn(text=w["text"], startMs=int(w["startMs"]), endMs=int(w["endMs"]))
+        for w in fixed_words
+        if str(w.get("text", "")).strip()
+    ]
+    sub_req = SubtitleRequest(
+        job_id=req.job_id,
+        clip_index=req.clip_index,
+        preset=req.preset or "tiktok",
+        words=word_models,
+    )
+    res = await add_subtitles(sub_req, request)
+    return {
+        **res,
+        "fixed_words": fixed_words,
+        "romanized": req.romanize,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CAPCUT PRO STUDIO ENDPOINTS (100% Free All-in-One Editing Engine)
+# ═══════════════════════════════════════════════════════════════════════════
+import capcut_studio
+
+
+def _resolve_studio_clip_path(job_id: str, clip_index: int = 0, input_filename: Optional[str] = None) -> Tuple[str, str, Optional[dict]]:
+    """Resolve the physical MP4 path and job directory for any job clip or standalone studio upload."""
+    safe_job = os.path.basename(str(job_id or "").strip())
+    if not safe_job:
+        raise HTTPException(status_code=400, detail="Missing job_id")
+    job_dir = os.path.join(OUTPUT_DIR, safe_job)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail=f"Job folder not found: {safe_job}")
+
+    job_obj = jobs.get(safe_job)
+    clip_obj = None
+    if job_obj and isinstance(job_obj.get("clips"), list) and 0 <= clip_index < len(job_obj["clips"]):
+        clip_obj = job_obj["clips"][clip_index]
+
+    candidates = []
+    if input_filename:
+        candidates.append(os.path.join(job_dir, os.path.basename(input_filename)))
+    if clip_obj and clip_obj.get("video_url"):
+        candidates.append(os.path.join(job_dir, os.path.basename(clip_obj["video_url"])))
+    if clip_obj and clip_obj.get("filename"):
+        candidates.append(os.path.join(job_dir, os.path.basename(clip_obj["filename"])))
+
+    # Fallback: scan mp4 files in job_dir
+    for fn in sorted(os.listdir(job_dir)):
+        if fn.lower().endswith(".mp4"):
+            candidates.append(os.path.join(job_dir, fn))
+
+    for c in candidates:
+        if os.path.isfile(c) and os.path.getsize(c) > 512:
+            return c, job_dir, clip_obj
+
+    raise HTTPException(status_code=404, detail="Video file not found for this clip")
+
+
+@app.get("/api/studio/catalog")
+async def api_studio_catalog():
+    """Return all CapCut Studio filters, effects, transitions, speed curves, audio library, TTS voices & templates."""
+    return capcut_studio.get_studio_catalog()
+
+
+@app.get("/api/studio/audio/{kind}/{asset_id}")
+async def api_studio_audio_preview(kind: str, asset_id: str):
+    """Synthesize (if needed) and stream royalty-free background music or SFX WAV."""
+    if kind not in ("music", "sfx"):
+        raise HTTPException(status_code=400, detail="kind must be 'music' or 'sfx'")
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", asset_id)
+    loop = asyncio.get_running_loop()
+    wav_path = await loop.run_in_executor(None, lambda: capcut_studio.ensure_audio_asset(safe_id, kind))
+    return FileResponse(wav_path, media_type="audio/wav", filename=os.path.basename(wav_path))
+
+
+@app.get("/api/studio/asset/{filename}")
+async def api_studio_asset(filename: str):
+    """Serve generated TTS or studio media assets."""
+    safe_name = os.path.basename(filename)
+    path = capcut_studio.STUDIO_DIR / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Studio asset not found")
+    media = "audio/mpeg" if safe_name.endswith(".mp3") else ("audio/wav" if safe_name.endswith(".wav") else "video/mp4")
+    return FileResponse(str(path), media_type=media, filename=safe_name)
+
+
+@app.post("/api/studio/upload")
+async def api_studio_upload_video(file: UploadFile = File(...)):
+    """Upload any local video directly into CapCut Studio as a standalone editable project."""
+    job_id = f"studio_{uuid.uuid4().hex[:10]}"
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    ext = os.path.splitext(file.filename or "video.mp4")[1].lower()
+    if ext not in (".mp4", ".mov", ".mkv", ".webm"):
+        ext = ".mp4"
+    filename = f"clip_1_source{ext}"
+    dest = os.path.join(job_dir, filename)
+
+    with open(dest, "wb") as out_f:
+        while chunk := await file.read(1024 * 1024):
+            out_f.write(chunk)
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", dest],
+        capture_output=True, text=True,
+    )
+    try:
+        dur = round(float(probe.stdout.strip()), 2)
+    except Exception:
+        dur = 30.0
+
+    video_url = f"/videos/{job_id}/{filename}"
+    clip_entry = {
+        "index": 0,
+        "title": os.path.splitext(file.filename or "Studio Project")[0],
+        "filename": filename,
+        "video_url": video_url,
+        "start": 0.0,
+        "end": dur,
+        "score": 95,
+        "hook": "",
+    }
+    jobs[job_id] = {
+        "status": "completed",
+        "video_title": clip_entry["title"],
+        "clips": [clip_entry],
+        "logs": ["Uploaded to CapCut Studio"],
+        "created_at": time.time(),
+    }
+    _save_job_manifest(job_id)
+    return {"job_id": job_id, "clip_index": 0, "clip": clip_entry, "video_url": video_url, "duration": dur}
+
+
+class StudioClipRef(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    input_filename: Optional[str] = None
+    sensitivity: float = 1.35
+    noise_db: float = -35.0
+    min_silence_dur: float = 0.45
+
+
+@app.post("/api/studio/detect-beats")
+async def api_studio_detect_beats(req: StudioClipRef):
+    """Detect musical beats & BPM on a clip for beat-synced timeline cuts."""
+    vpath, _, _ = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: capcut_studio.detect_audio_beats(vpath, req.sensitivity))
+
+
+@app.post("/api/studio/remove-silence")
+async def api_studio_remove_silence(req: StudioClipRef):
+    """Detect silent pauses / dead air and return tight jump-cut segments."""
+    vpath, _, _ = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.detect_non_silent_segments(vpath, req.noise_db, req.min_silence_dur),
+    )
+
+
+@app.post("/api/studio/auto-color")
+async def api_studio_auto_color(req: StudioClipRef):
+    """Compute auto color grading sliders from clip frame luminance & RGB histograms."""
+    vpath, _, _ = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: capcut_studio.analyze_auto_color(vpath))
+
+
+class StudioTTSRequest(BaseModel):
+    text: str
+    character_id: str = "ava_creator"
+    custom_voice: str = ""
+
+
+@app.post("/api/studio/tts")
+async def api_studio_tts(req: StudioTTSRequest):
+    """Synthesize AI character voiceover or natural TTS for timeline overlay."""
+    if not (req.text or "").strip():
+        raise HTTPException(status_code=400, detail="Provide text for TTS")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.synthesize_studio_tts(req.text, req.character_id, req.custom_voice),
+    )
+
+
+class StudioRemoveBgRequest(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    input_filename: Optional[str] = None
+    bg_mode: str = "blur"
+    bg_color: str = "#10B981"
+    feather: float = 0.15
+
+
+@app.post("/api/studio/remove-bg")
+async def api_studio_remove_bg(req: StudioRemoveBgRequest):
+    """Remove/replace video background without needing a green screen."""
+    vpath, job_dir, clip_obj = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    out_name = f"nobg_{int(time.time())}_{os.path.basename(vpath)}"
+    out_path = os.path.join(job_dir, out_name)
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.remove_background_smart(vpath, out_path, req.bg_mode, req.bg_color, req.feather),
+    )
+    video_url = f"/videos/{os.path.basename(req.job_id)}/{out_name}"
+    if clip_obj is not None:
+        clip_obj["video_url"] = video_url
+        clip_obj["filename"] = out_name
+        _save_job_manifest(os.path.basename(req.job_id))
+    return {"status": "completed", "video_url": video_url, "filename": out_name}
+
+
+class StudioUpscaleRequest(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    input_filename: Optional[str] = None
+    target_res: str = "1080p"
+    denoise: bool = True
+    sharpen: float = 0.75
+    interpolate_60fps: bool = False
+
+
+@app.post("/api/studio/upscale")
+async def api_studio_upscale(req: StudioUpscaleRequest):
+    """Upscale & enhance video quality (Lanczos + 3D Denoise + CAS Sharpen + optional 60fps)."""
+    vpath, job_dir, clip_obj = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    out_name = f"upscaled_{int(time.time())}_{os.path.basename(vpath)}"
+    out_path = os.path.join(job_dir, out_name)
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.upscale_and_enhance_video(
+            vpath, out_path, req.target_res, req.denoise, req.sharpen, req.interpolate_60fps
+        ),
+    )
+    video_url = f"/videos/{os.path.basename(req.job_id)}/{out_name}"
+    if clip_obj is not None:
+        clip_obj["video_url"] = video_url
+        clip_obj["filename"] = out_name
+        _save_job_manifest(os.path.basename(req.job_id))
+    return {"status": "completed", "video_url": video_url, "filename": out_name}
+
+
+@app.post("/api/studio/edit-pilot")
+async def api_studio_edit_pilot(req: StudioClipRef, request: Request):
+    """Run AI Edit Pilot to automatically analyze beats, silences, color & transcript and suggest a full edit recipe."""
+    vpath, _, clip_obj = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    words = []
+    try:
+        tx = await get_clip_transcript(req.job_id, req.clip_index, request)
+        words = tx.get("captions") or []
+    except Exception:
+        pass
+    title = (clip_obj or {}).get("title") or ""
+    gemini_key = await resolve_gemini(request) or ""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.run_edit_pilot(vpath, words, title, gemini_key),
+    )
+
+
+class StudioRenderRequest(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    input_filename: Optional[str] = None
+    recipe: Dict[str, Any]
+
+
+@app.post("/api/studio/render")
+async def api_studio_render(req: StudioRenderRequest):
+    """Render full multi-layer CapCut Studio recipe to MP4 and update clip video_url."""
+    vpath, job_dir, clip_obj = _resolve_studio_clip_path(req.job_id, req.clip_index, req.input_filename)
+    base_clean = re.sub(r"^(studio_\d+_)+", "", os.path.basename(vpath))
+    out_name = f"studio_{int(time.time())}_{base_clean}"
+    out_path = os.path.join(job_dir, out_name)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: capcut_studio.render_studio_project(vpath, out_path, req.recipe),
+    )
+    video_url = f"/videos/{os.path.basename(req.job_id)}/{out_name}"
+    if clip_obj is not None:
+        clip_obj["video_url"] = video_url
+        clip_obj["filename"] = out_name
+        clip_obj["studio_recipe"] = req.recipe
+        _save_job_manifest(os.path.basename(req.job_id))
+    return {
+        **result,
+        "video_url": video_url,
+        "filename": out_name,
+    }
+

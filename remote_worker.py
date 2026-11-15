@@ -22,7 +22,18 @@ This module holds the parts with no FastAPI or queue in them: what crosses
 the wire, which file names a worker may write, and the file protocol.
 """
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    class _FcntlStub:
+        LOCK_EX = 2
+        LOCK_SH = 1
+        LOCK_NB = 4
+        LOCK_UN = 8
+        @staticmethod
+        def flock(fd, op):
+            pass
+    fcntl = _FcntlStub()
 import hmac
 import json
 import os

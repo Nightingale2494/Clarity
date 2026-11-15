@@ -22,7 +22,6 @@ import { guidePages } from './guide-pages.js'
 import { clipToolPages } from './clip-tools.js'
 import { hubPages } from './hub-pages.js'
 import { productPages } from './product-pages.js'
-import { pricingPage } from './pricing-page.js'
 
 const li = (items) => `<ul>${items.map((i) => `<li>${i}</li>`).join('')}</ul>`
 const ol = (items) => `<ol>${items.map((i) => `<li>${i}</li>`).join('')}</ol>`
@@ -3522,7 +3521,6 @@ export function buildPages() {
     automateShorts(),
     n8nTemplate(),
     opusVsVizard(),
-    pricingPage(),
   ].map((p) => ({
     ...p,
     related: p.related || RELATED[p.path],

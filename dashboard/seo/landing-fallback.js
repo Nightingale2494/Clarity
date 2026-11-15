@@ -126,7 +126,7 @@ const HERO_FORM = `<form id="seo-hero-form" action="/#app" method="get" style="d
     <input id="seo-hero-url" type="url" name="url" placeholder="Paste a YouTube link" autocomplete="off" style="flex:1 1 18rem;min-width:0;padding:.8rem 1rem;border-radius:10px;border:1px solid oklch(96% 0.006 262 / .16);background:oklch(16.5% 0.015 265);color:oklch(96% 0.006 262);font:inherit;font-size:1rem">
     <button type="submit" style="padding:.8rem 1.3rem;border-radius:10px;border:0;background:oklch(76% 0.17 50);color:oklch(13% 0.014 265);font:inherit;font-weight:600;cursor:pointer">Get free clips &rarr;</button>
   </form>
-  <script>(function(){var f=document.getElementById('seo-hero-form');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var u=(f.elements.url.value||'').trim();try{if(u)localStorage.setItem('os_pending_url',u);localStorage.setItem('openshorts_skip_landing','1')}catch(_){}location.hash='#app'})})()</script>`
+  <script>(function(){var f=document.getElementById('seo-hero-form');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var u=(f.elements.url.value||'').trim();try{if(u)localStorage.setItem('clarity_pending_url',u);localStorage.setItem('clarity_skip_landing','1')}catch(_){}location.hash='#app'})})()</script>`
 
 /* Per-platform links, the same ones and in the same order as WORKS_WITH,
  * PLATFORMS and SWITCHING in Landing.jsx. */

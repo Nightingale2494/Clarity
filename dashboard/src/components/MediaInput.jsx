@@ -52,17 +52,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Auto-hook: burn the AI hook text into every clip. On by default; the
     // choice persists so turning it off sticks across sessions.
     const [autoHook, setAutoHook] = useState(() => {
-        try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
+        try { return localStorage.getItem('clarity_auto_hook') !== '0'; } catch { return true; }
     });
     const [autoHookStyle, setAutoHookStyle] = useState(() => {
         // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
-        try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
+        try { return localStorage.getItem('clarity_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
     });
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
     const [layout, setLayout] = useState(() => {
-        try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
+        try { return localStorage.getItem('clarity_layout') || 'auto'; } catch { return 'auto'; }
     });
     const infoRef = useRef(null);
 
@@ -108,8 +108,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
     useEffect(() => {
         let pending = null;
         try {
-            pending = localStorage.getItem('os_pending_url');
-            if (pending) localStorage.removeItem('os_pending_url');
+            pending = localStorage.getItem('clarity_pending_url');
+            if (pending) localStorage.removeItem('clarity_pending_url');
         } catch { /* ignore */ }
         if (pending) {
             setMode('url');
@@ -131,9 +131,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
             sourceEnd: range ? Math.round(range.end) : null,
         };
         try {
-            localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
-            localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
-            localStorage.setItem('os_layout', layout);
+            localStorage.setItem('clarity_auto_hook', autoHook ? '1' : '0');
+            localStorage.setItem('clarity_auto_hook_style_v2', autoHookStyle);
+            localStorage.setItem('clarity_layout', layout);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });

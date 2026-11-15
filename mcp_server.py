@@ -7,18 +7,12 @@ plus notifications, and owning those ~200 lines beats carrying the full SDK as
 a dependency for them.
 
 Tools don't reimplement anything: each one is an in-process HTTP call back into
-this same app (httpx ASGITransport) with the caller's auth headers forwarded.
-Cloud mode therefore meters, gates and scopes agent calls exactly like
-dashboard calls — an ``osk_`` API key IS the user (see cloud/api_keys.py).
-Self-host keeps its BYOK semantics: no key required, ``X-Gemini-Key`` /
-env fallbacks apply unchanged.
+this same app (httpx ASGITransport) with the caller's headers forwarded.
+Clarity uses free BYOK / local LLM semantics: no account key required,
+``X-Gemini-Key`` / env fallbacks apply unchanged.
 
 Connect with any MCP client, e.g.:
-    claude mcp add --transport http openshorts https://mcp.openshorts.app/mcp \
-        --header "Authorization: Bearer osk_..."
-
-(mcp.openshorts.app is a domain alias of the API app; api.openshorts.app/mcp
-serves the identical endpoint.)
+    claude mcp add --transport http clarity http://localhost:8000/mcp
 """
 import json
 import os
@@ -35,20 +29,18 @@ from subtitles import CAPTION_PRESETS, line_budget
 router = APIRouter()
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "openshorts", "title": "OpenShorts", "version": "1.0.0"}
+SERVER_INFO = {"name": "clarity", "title": "Clarity", "version": "1.0.0"}
 # Kept descriptive: app-directory review flags instructions that read as
 # commands to the model (capitals, "do not use other tools", upsell steps).
 INSTRUCTIONS = (
-    "OpenShorts turns long videos (YouTube URLs or direct video files) into "
+    "Clarity turns long videos (YouTube URLs or direct video files) into "
     "short vertical clips. process_video takes the video URL as the user gave "
-    "it; OpenShorts downloads, transcribes and analyses the video on its own "
-    "servers, so the video does not need to be opened or transcribed first. "
+    "it; Clarity downloads, transcribes and analyses the video on its own "
+    "server, so the video does not need to be opened or transcribed first. "
     "Typical flow: process_video, then get_job_status until the job is "
     "'completed' (a job takes a few minutes; checking every 30-60 seconds is "
     "enough, or pass webhook_url), then list_clips, and optionally "
-    "add_subtitles, recut_clip or publish_clip. get_quota shows the minutes "
-    "left. If a tool reports quota_exceeded or no_plan, it also returns an "
-    "upgrade_url the user can open to add minutes. Processing requires the "
+    "add_subtitles, recut_clip or publish_clip. Processing requires the "
     "user to own the video or hold the rights to it: confirm this with the "
     "user, then pass confirm_rights=true. publish_clip posts only to the "
     "accounts the user connected, and only when the user asks for it."
@@ -66,7 +58,7 @@ TOOLS = [
         "name": "process_video",
         "title": "Process a video into short clips",
         "description": (
-            "Start clipping a video from its URL. OpenShorts downloads the "
+            "Start clipping a video from its URL. Clarity downloads the "
             "source itself, transcribes it, finds the most viral moments with AI "
             "and renders vertical (9:16) clips. Captions and the AI hook line are "
             "burned by default; pass captions=false or auto_hook=false to skip either. "
@@ -130,7 +122,7 @@ TOOLS = [
                 },
                 "webhook_secret": {
                     "type": "string",
-                    "description": "Optional secret; the webhook body is then HMAC-SHA256 signed (X-OpenShorts-Signature).",
+                    "description": "Optional secret; the webhook body is then HMAC-SHA256 signed (X-Clarity-Signature).",
                 },
                 "force_low_quality": {
                     "type": "boolean",
@@ -364,7 +356,7 @@ def _client(request: Request) -> httpx.AsyncClient:
     headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARD_HEADERS}
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=request.app, raise_app_exceptions=False),
-        base_url="http://openshorts.internal",
+        base_url="http://clarity.internal",
         headers=headers,
         timeout=300.0,
     )
@@ -461,13 +453,7 @@ def _source_segments(clip):
 
 
 def _media_secret() -> str:
-    if not _billing_enabled():
-        return ""
-    try:
-        from cloud.config import settings
-        return settings.jwt_secret or ""
-    except Exception:
-        return ""
+    return ""
 
 
 def _clip_url(base, rel):
@@ -521,25 +507,11 @@ async def _tool_list_clips(client, args):
 
 
 async def _tool_get_quota(client, args):
-    resp = await client.get("/api/me")
-    # 401: anonymous. 404: self-host, where /api/me isn't even mounted (the
-    # cloud router only registers under BILLING_ENABLED). Neither is an error
-    # from the agent's point of view — there is simply no quota to report.
-    if resp.status_code in (401, 404):
-        return {"self_host_or_anonymous": True,
-                "note": "No authenticated cloud user; if this is a self-hosted "
-                        "instance there is no minute quota."}, False
-    if resp.status_code >= 400:
-        return _api_error(resp), True
-    data = resp.json()
-    out = {"plan": data.get("plan"), "entitled": data.get("entitled"),
-           "minutes": data.get("minutes"),
-           "upload_post_profile": data.get("upload_post_profile")}
-    if data.get("plan") in (None, "free") or not data.get("entitled"):
-        # The link an agent hands the user when the free minutes run short.
-        from cloud.config import settings
-        out["upgrade_url"] = f"{settings.frontend_url}/#/pricing?plan=starter&src=api"
-    return out, False
+    return {
+        "self_host_or_anonymous": True,
+        "unlimited": True,
+        "note": "Clarity is free to use with no minute quota.",
+    }, False
 
 
 async def _tool_add_subtitles(client, args):
@@ -710,36 +682,15 @@ async def handle_message(msg, tool_caller) -> Optional[dict]:
 # Transport endpoints
 # --------------------------------------------------------------------------- #
 def _billing_enabled() -> bool:
-    return os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
+    return False
 
 
 async def _authorized(request: Request) -> bool:
-    """Cloud mode requires a resolvable user (API key or JWT) before any RPC.
-
-    The internal endpoints would each reject anonymous calls anyway; failing
-    once here with a clear 401 is what lets MCP clients surface 'add your API
-    key' instead of a per-tool 402. Self-host stays open (BYOK)."""
-    if not _billing_enabled():
-        return True
-    from cloud.auth import get_current_user_optional
-    return (await get_current_user_optional(request)) is not None
+    return True
 
 
 @router.post("/mcp")
 async def mcp_endpoint(request: Request):
-    if not await _authorized(request):
-        # OAuth-capable clients (claude.ai, ChatGPT) read resource_metadata off
-        # this header and run the login flow themselves; everyone else gets the
-        # API-key hint in the body.
-        from cloud import mcp_oauth
-        u = request.base_url
-        return JSONResponse(
-            {"error": "Authentication required. Connect with OAuth (claude.ai, ChatGPT) "
-                      "or pass an OpenShorts API key: Authorization: Bearer osk_... "
-                      "(create one in the dashboard)."},
-            status_code=401,
-            headers={"WWW-Authenticate": mcp_oauth.www_authenticate(f"{u.scheme}://{u.netloc}")},
-        )
     try:
         msg = json.loads(await request.body())
     except Exception:

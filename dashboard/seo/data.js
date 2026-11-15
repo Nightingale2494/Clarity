@@ -14,7 +14,7 @@
 export const SITE = {
   // www is what the apex already redirects to, so it is the canonical host.
   url: 'https://www.openshorts.app',
-  name: 'OpenShorts',
+  name: 'Clarity',
   repo: 'https://github.com/mutonby/openshorts',
   logo: 'https://www.openshorts.app/logo-openshorts.png',
   ogImage: 'https://www.openshorts.app/og-image.png',

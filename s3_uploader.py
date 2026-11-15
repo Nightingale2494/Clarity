@@ -1,9 +1,17 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()
-import boto3
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    from botocore.config import Config
+except ImportError:
+    boto3 = None
+    ClientError = Exception
+    Config = None
 import logging
+import json
+import time as time_module
 
 # Configure silent logging for boto3 and botocore
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
@@ -17,6 +25,8 @@ def upload_file_to_s3(file_path, bucket_name, s3_key):
     """
     Upload a file to an S3 bucket silently.
     """
+    if boto3 is None:
+        return False
     access_key = os.environ.get('AWS_ACCESS_KEY_ID')
     secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -41,10 +51,6 @@ def upload_file_to_s3(file_path, bucket_name, s3_key):
         return False
 
 
-from botocore.config import Config
-import json
-import time as time_module
-
 # Simple in-memory cache for gallery clips
 _clips_cache = {
     "data": None,
@@ -54,6 +60,8 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 def get_s3_client():
     """Returns an authenticated S3 client."""
+    if boto3 is None:
+        return None
     access_key = os.environ.get('AWS_ACCESS_KEY_ID')
     secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -189,292 +197,6 @@ def list_all_clips(bucket_name=None, limit=50, force_refresh=False):
     _clips_cache["timestamp"] = now
 
     return all_clips[:limit] if limit else all_clips
-
-# Actors generated for a signed-in user are theirs: the prompt that made them
-# names the product they are holding. They live under a prefix the public
-# gallery never lists, with a random key, and are handed out as presigned
-# URLs (SigV4 caps those at 7 days). The shared ``avatars/`` gallery keeps the
-# images that were published there before, minus the product half of their
-# description.
-PRIVATE_ACTOR_PREFIX = "private/actors/"
-ACTOR_URL_TTL_SECONDS = int(os.environ.get("ACTOR_URL_TTL_SECONDS", str(7 * 24 * 3600)))
-
-import re as _re
-_HOLDING_RE = _re.compile(r"\s*\(holding .*\)\s*$", _re.DOTALL)
-
-
-def public_actor_description(description):
-    """The gallery caption without the "(holding <product>)" part."""
-    return _HOLDING_RE.sub("", description or "").strip()
-
-
-def _presign(s3_client, bucket_name, key, ttl=None):
-    return s3_client.generate_presigned_url(
-        'get_object', Params={'Bucket': bucket_name, 'Key': key},
-        ExpiresIn=int(ttl or ACTOR_URL_TTL_SECONDS))
-
-
-def upload_actor_to_s3(file_path, description="", owner_tag=None):
-    """
-    Upload an actor image. With ``owner_tag`` (cloud: an opaque per-user tag)
-    it goes to the owner's private prefix and the return is a presigned URL;
-    without one (self-host) to the public gallery, as before.
-    Returns the URL or None on failure.
-    """
-    bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
-    region = os.environ.get('AWS_REGION', 'eu-west-3')
-
-    s3_client = get_s3_client()
-    if not s3_client:
-        return None
-
-    import uuid
-    filename = os.path.basename(file_path)
-    name, ext = os.path.splitext(filename)
-    if owner_tag:
-        s3_key = f"{PRIVATE_ACTOR_PREFIX}{owner_tag}/{uuid.uuid4().hex}{ext}"
-    else:
-        s3_key = f"avatars/{name}_{str(uuid.uuid4())[:8]}{ext}"
-
-    try:
-        # Skip broken/tiny files
-        if os.path.getsize(file_path) < 1000:
-            logger.warning(f"Skipping tiny file ({os.path.getsize(file_path)} bytes): {file_path}")
-            return None
-
-        s3_client.upload_file(
-            file_path, bucket_name, s3_key,
-            ExtraArgs={'ContentType': 'image/png'},
-        )
-        if owner_tag:
-            url = _presign(s3_client, bucket_name, s3_key)
-        else:
-            url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
-
-        # Save metadata JSON alongside the image
-        if description:
-            import datetime
-            meta_key = s3_key.rsplit('.', 1)[0] + '.json'
-            meta = {
-                "description": description,
-                "created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            }
-            if not owner_tag:
-                meta["url"] = url
-            s3_client.put_object(
-                Bucket=bucket_name, Key=meta_key,
-                Body=json.dumps(meta, ensure_ascii=False).encode('utf-8'),
-                ContentType='application/json',
-            )
-
-        logger.info(f"Uploaded actor to S3: {s3_key}")
-        return url
-    except Exception as e:
-        logger.error(f"Failed to upload actor to S3: {e}")
-        return None
-
-
-def _list_actor_prefix(s3_client, bucket_name, prefix):
-    """{base_key: {'image': obj, 'meta_key': key}} under one prefix."""
-    paginator = s3_client.get_paginator('list_objects_v2')
-    all_objects = {}
-    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-        for obj in page.get('Contents', []):
-            key = obj['Key']
-            base = key.rsplit('.', 1)[0]
-            entry = all_objects.setdefault(base, {})
-            if key.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                entry['image'] = obj
-            elif key.endswith('.json'):
-                entry['meta_key'] = key
-    return all_objects
-
-
-def _read_description(s3_client, bucket_name, meta_key):
-    try:
-        meta_resp = s3_client.get_object(Bucket=bucket_name, Key=meta_key)
-        return json.loads(meta_resp['Body'].read().decode('utf-8')).get('description', '')
-    except Exception:
-        return ''
-
-
-def list_actor_gallery(owner_tag=None):
-    """
-    The shared actor gallery (public images, product stripped from their
-    captions) plus, with ``owner_tag``, the caller's own private actors as
-    presigned URLs (full caption: it is their own prompt). Newest first, the
-    caller's own ahead of the shared ones.
-    """
-    bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
-    region = os.environ.get('AWS_REGION', 'eu-west-3')
-
-    s3_client = get_s3_client()
-    if not s3_client:
-        return []
-
-    try:
-        own = []
-        if owner_tag:
-            for base, data in _list_actor_prefix(
-                    s3_client, bucket_name, f"{PRIVATE_ACTOR_PREFIX}{owner_tag}/").items():
-                if 'image' not in data:
-                    continue
-                obj = data['image']
-                own.append({
-                    "url": _presign(s3_client, bucket_name, obj['Key']),
-                    "key": obj['Key'].rsplit('/', 1)[-1],
-                    "created_at": obj['LastModified'].isoformat(),
-                    "description": (_read_description(s3_client, bucket_name, data['meta_key'])
-                                    if 'meta_key' in data else ""),
-                    "mine": True,
-                })
-        shared = []
-        for base, data in _list_actor_prefix(s3_client, bucket_name, 'avatars/').items():
-            if 'image' not in data:
-                continue
-            obj = data['image']
-            key = obj['Key']
-            shared.append({
-                "url": f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}",
-                "key": key,
-                "created_at": obj['LastModified'].isoformat(),
-                "description": (public_actor_description(
-                    _read_description(s3_client, bucket_name, data['meta_key']))
-                    if 'meta_key' in data else ""),
-            })
-        own.sort(key=lambda x: x['created_at'], reverse=True)
-        shared.sort(key=lambda x: x['created_at'], reverse=True)
-        return own + shared
-
-    except Exception as e:
-        logger.error(f"Failed to list actor gallery: {e}")
-        return []
-
-
-# ── SaaS Video Gallery (public S3) ──────────────────────────────────
-
-_video_gallery_cache = {
-    "data": None,
-    "timestamp": 0,
-}
-
-def upload_video_to_gallery(video_path, actor_image_path, metadata, video_id=None):
-    """
-    Upload a generated UGC video + actor + metadata to the public S3 bucket.
-    Returns dict with public URLs or None on failure.
-    """
-    import uuid
-    bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
-    region = os.environ.get('AWS_REGION', 'eu-west-3')
-
-    s3_client = get_s3_client()
-    if not s3_client:
-        return None
-
-    if not video_id:
-        video_id = str(uuid.uuid4())[:8]
-
-    base_url = f"https://{bucket_name}.s3.{region}.amazonaws.com"
-    results = {}
-
-    try:
-        # Upload video
-        if os.path.exists(video_path):
-            s3_key = f"videos/{video_id}/video.mp4"
-            s3_client.upload_file(video_path, bucket_name, s3_key,
-                                 ExtraArgs={'ContentType': 'video/mp4'})
-            results["video_url"] = f"{base_url}/{s3_key}"
-
-        # Upload actor image
-        if actor_image_path and os.path.exists(actor_image_path):
-            s3_key = f"videos/{video_id}/actor.png"
-            s3_client.upload_file(actor_image_path, bucket_name, s3_key,
-                                 ExtraArgs={'ContentType': 'image/png'})
-            results["actor_url"] = f"{base_url}/{s3_key}"
-
-        # Build and upload metadata
-        import datetime
-        metadata["video_id"] = video_id
-        metadata["video_url"] = results.get("video_url", "")
-        metadata["actor_url"] = results.get("actor_url", "")
-        metadata["created_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-
-        meta_json = json.dumps(metadata, ensure_ascii=False, indent=2)
-        s3_key = f"videos/{video_id}/metadata.json"
-        s3_client.put_object(
-            Bucket=bucket_name, Key=s3_key,
-            Body=meta_json.encode('utf-8'),
-            ContentType='application/json',
-        )
-        results["metadata_url"] = f"{base_url}/{s3_key}"
-        results["video_id"] = video_id
-
-        logger.info(f"Uploaded video gallery: {video_id}")
-
-        # Invalidate cache
-        _video_gallery_cache["data"] = None
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Failed to upload video to gallery: {e}")
-        return None
-
-
-def list_video_gallery(limit=50, force_refresh=False):
-    """
-    List all UGC videos from the public S3 bucket.
-    Returns list of metadata dicts, newest first.
-    """
-    global _video_gallery_cache
-
-    now = time_module.time()
-    if not force_refresh and _video_gallery_cache["data"] is not None:
-        if now - _video_gallery_cache["timestamp"] < CACHE_TTL_SECONDS:
-            cached = _video_gallery_cache["data"]
-            return cached[:limit] if limit else cached
-
-    bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
-
-    s3_client = get_s3_client()
-    if not s3_client:
-        return []
-
-    videos = []
-
-    try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=bucket_name, Prefix='videos/')
-
-        meta_files = []
-        for page in pages:
-            for obj in page.get('Contents', []):
-                if obj['Key'].endswith('/metadata.json'):
-                    meta_files.append(obj)
-
-        # Newest first
-        meta_files.sort(key=lambda x: x['LastModified'], reverse=True)
-
-        for meta_obj in meta_files:
-            try:
-                obj_resp = s3_client.get_object(Bucket=bucket_name, Key=meta_obj['Key'])
-                content = obj_resp['Body'].read().decode('utf-8')
-                data = json.loads(content)
-                videos.append(data)
-                if limit and len(videos) >= limit:
-                    break
-            except Exception as e:
-                logger.error(f"Error reading metadata {meta_obj['Key']}: {e}")
-                continue
-
-    except Exception as e:
-        logger.error(f"Failed to list video gallery: {e}")
-        return []
-
-    _video_gallery_cache["data"] = videos
-    _video_gallery_cache["timestamp"] = now
-
-    return videos[:limit] if limit else videos
 
 
 def upload_job_artifacts(directory, job_id):

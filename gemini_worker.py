@@ -589,18 +589,10 @@ def main() -> int:
     parser.add_argument("--model", default="gemini-2.5-flash")
     args = parser.parse_args()
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing GEMINI_API_KEY.")
-
     with open(args.input_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    model_name = args.model
-    client = genai.Client(api_key=api_key)
-    config = _config_for_strategy(args.strategy, args.mode, model_name)
     language = str(payload.get("language") or "unknown")
-
     template = SCORE_PROMPT_TEMPLATE if args.mode == "score" else DETAIL_PROMPT_TEMPLATE
     fmt = {
         "video_duration": payload["video_duration"],
@@ -608,12 +600,73 @@ def main() -> int:
         "windows_json": json.dumps(payload["windows"], ensure_ascii=False),
     }
     if args.mode != "score":
-        # Score mode receives every window, not a shortlist, so a count target
-        # derived from it would be meaningless — and the score template has no
-        # placeholder for one: it ranks whatever it is given.
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    from ai_hub import call_ai, current_settings
+    active_ai = current_settings(api_key or "")
+
+    # If the user selected a non-Gemini provider in AI Hub (e.g. local Ollama, Groq, DeepSeek, OpenRouter, Claude)
+    # or has no Gemini key, handle scoring/detailing via AI Hub or loudness/heuristic fallback!
+    if active_ai["provider"] != "gemini" or not api_key:
+        _log(f"🤖 AI Hub worker request: provider={active_ai['provider']} mode={args.mode} items={len(payload.get('windows', []))}")
+        windows = payload.get("windows") or []
+        if active_ai["provider"] == "loudness":
+            if args.mode == "score":
+                scored = [
+                    {"id": str(w.get("id", i)), "start": float(w.get("start", 0)), "end": float(w.get("end", 30)), "score": max(50, 90 - i * 5), "reason": "Selected in offline mode"}
+                    for i, w in enumerate(windows)
+                ]
+                parsed = {"windows": scored}
+            else:
+                min_s, max_s = clip_duration_bounds()
+                shorts = []
+                for i, w in enumerate(windows[:fmt.get("max_clips", 5)]):
+                    ws = float(w.get("start", 0))
+                    we = min(float(w.get("end", ws + 30)), ws + max_s)
+                    if we - ws < min_s:
+                        we = min(float(payload["video_duration"]), ws + min_s)
+                    shorts.append({
+                        "start": round(ws, 2),
+                        "end": round(we, 2),
+                        "source_window_id": str(w.get("id", i)),
+                        "predicted_score": max(65, 92 - i * 4),
+                        "video_description_for_tiktok": "Watch till the end! #shorts #clips #highlights",
+                        "video_description_for_instagram": "Best moment from the video #reels #highlights",
+                        "video_title_for_youtube_short": f"Highlight Clip #{i + 1}",
+                        "viral_hook_text": "WAIT FOR THIS MOMENT",
+                        "why": "High-energy segment",
+                    })
+                parsed = {"shorts": shorts}
+        else:
+            schema = (
+                ScoreResponse.model_json_schema()
+                if args.mode == "score"
+                else DetailResponse.model_json_schema()
+            )
+            out = call_ai(prompt, schema=None, purpose=f"Clip {args.mode}", override_gemini_key=api_key or "")
+            if isinstance(out, list):
+                parsed = {"windows": out} if args.mode == "score" else {"shorts": out}
+            elif isinstance(out, dict):
+                parsed = out
+            else:
+                parsed = {"windows": []} if args.mode == "score" else {"shorts": []}
+        result = {
+            "mode": args.mode,
+            "payload": parsed,
+            "cost_analysis": {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "input_cost": 0.0, "output_cost": 0.0, "total_cost": 0.0, "model": (active_ai["models"] or ["local"])[0], "price_estimated": False},
+            "raw_text": json.dumps(parsed),
+        }
+        with open(args.output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        _log(f"✅ AI Hub worker success: provider={active_ai['provider']} mode={args.mode}")
+        return 0
+
+    model_name = args.model
+    client = genai.Client(api_key=api_key)
+    config = _config_for_strategy(args.strategy, args.mode, model_name)
 
     _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
     response = client.models.generate_content(

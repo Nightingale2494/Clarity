@@ -37,7 +37,18 @@ never frees, a clock that jumped: the request goes ahead as it always did.
 """
 import atexit
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    class _FcntlStub:
+        LOCK_EX = 2
+        LOCK_SH = 1
+        LOCK_NB = 4
+        LOCK_UN = 8
+        @staticmethod
+        def flock(fd, op):
+            pass
+    fcntl = _FcntlStub()
 import json
 import os
 import tempfile

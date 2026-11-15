@@ -20,7 +20,7 @@
 //                decision someone has to make here, in the open, rather than a
 //                <script> tag someone drops into index.html.
 
-const STORAGE_KEY = 'openshorts_consent';
+const STORAGE_KEY = 'clarity_consent';
 const VERSION = 1;
 
 export const CATEGORIES = ['necessary', 'analytics', 'marketing'];
@@ -52,12 +52,12 @@ export function isEEAVisitor() {
 
 export function refineGeo() {
   if (typeof window === "undefined" || typeof window.fetch !== "function") return;
-  try { if (window.localStorage.getItem(GEO_KEY)) return; } catch (e) {}
+  try { if (window.localStorage.getItem(GEO_KEY)) return; } catch (_) { /* ignore */ }
   fetch("/cdn-cgi/trace", { cache: "no-store" })
     .then((r) => (r.ok ? r.text() : ""))
     .then((t) => {
       const m = /^loc=([A-Z]{2})$/m.exec(t || "");
-      if (m) { try { window.localStorage.setItem(GEO_KEY, m[1]); } catch (e) {} }
+      if (m) { try { window.localStorage.setItem(GEO_KEY, m[1]); } catch (_) { /* ignore */ } }
     })
     .catch(() => {});
 }
@@ -111,7 +111,6 @@ export function onConsentChange(fn) {
  * document that never loads it.
  */
 export function setConsent(choice) {
-  const before = getConsent();
   const next = {
     v: VERSION,
     ts: new Date().toISOString(),
@@ -147,7 +146,7 @@ export function applyConsent() {
 
 // Reopening the banner from anywhere (the footer link) without threading props
 // through the whole tree.
-const OPEN_EVENT = 'openshorts:consent-open';
+const OPEN_EVENT = 'clarity:consent-open';
 export const openConsentManager = () => {
   try { window.dispatchEvent(new CustomEvent(OPEN_EVENT)); } catch (_) { /* ignore */ }
 };

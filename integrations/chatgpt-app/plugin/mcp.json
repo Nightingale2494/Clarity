@@ -1,20 +1,9 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
-    "openshorts": {
+    "clarity": {
       "type": "streamable-http",
-      "url": "https://mcp.openshorts.app/mcp",
-      "extensions": {
-        "com.openai": {
-          "auth": {
-            "type": "oauth",
-            "client": {
-              "mode": "dcr"
-            },
-            "baseScopes": ["openshorts"]
-          }
-        }
-      }
+      "url": "http://localhost:8000/mcp"
     }
   }
 }

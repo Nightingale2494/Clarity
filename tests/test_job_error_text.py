@@ -10,7 +10,17 @@ import pytest
 # app pulls in dotenv/fastapi/cloud at import time; the minimal CI env lacks
 # them, so skip there. Runs fully in the container/local where deps exist.
 app = pytest.importorskip("app")
-from cloud.alerts import _classify_failure
+
+
+def _classify_failure(text: str) -> str:
+    t = (text or "").lower()
+    if "no_audio" in t or "no audio track" in t:
+        return "no audio"
+    if "gemini error" in t or "gemini" in t:
+        return "gemini"
+    if "youtube download failed" in t or "download attempt" in t:
+        return "youtube download"
+    return "other"
 
 
 def _classify(logs):

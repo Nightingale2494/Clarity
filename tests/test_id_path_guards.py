@@ -46,7 +46,6 @@ def cloud(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setattr(app_module, "BILLING_ENABLED", True)
     monkeypatch.setattr(app_module, "jobs", {})
-    monkeypatch.setattr(app_module, "saas_jobs", {})
     monkeypatch.setattr(app_module, "thumbnail_sessions", {})
 
     async def fake_user(request):
@@ -155,26 +154,6 @@ class TestThumbnailPublishPath:
         (cloud / "thumbnails" / sid).mkdir()
         (cloud / "thumbnails" / sid / ".owner").write_text(OWNER)
         assert self._publish(sid, f"/thumbnails/{sid}/.owner").status_code == 400
-
-
-class TestSaasRetry:
-    def test_a_non_uuid_retry_id_is_rejected(self, cloud, monkeypatch):
-        async def entitled(request):
-            return None
-        monkeypatch.setattr(app_module, "require_managed_entitlement", entitled)
-        resp = _call("post", "/api/saasshorts/generate",
-                     headers={**_auth(ATTACKER), "X-Fal-Key": "f", "X-ElevenLabs-Key": "e"},
-                     json={"script": {"hook": "h"}, "retry_job_id": "x/../thumbnails"})
-        assert resp.status_code == 400
-        assert not (cloud / "thumbnails" / ".owner").exists()
-        assert not app_module.saas_jobs
-
-    def test_purge_never_deletes_a_shared_folder(self, cloud):
-        (cloud / "thumbnails" / "keep.jpg").write_bytes(b"k")
-        app_module.saas_jobs["evil"] = {"user_id": ATTACKER,
-                                        "output_dir": str(cloud / "thumbnails")}
-        app_module._purge_local_jobs_for_user(ATTACKER)
-        assert (cloud / "thumbnails" / "keep.jpg").exists()
 
 
 class TestDiskOwnerFallback:

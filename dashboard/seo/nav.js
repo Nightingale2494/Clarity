@@ -20,10 +20,8 @@
 
 export const REPO_URL = 'https://github.com/mutonby/openshorts'
 
-/* `/#app` opens the app (main.jsx): the paste box and the clip generator.
- * `/#app?login=1` opens it with the sign-in dialog already up (App.jsx). */
 export const APP_HREF = '/#app'
-export const LOGIN_HREF = '/#app?login=1'
+export const LOGIN_HREF = '/#app'
 
 export const NAV_GROUPS = [
   {
@@ -50,9 +48,6 @@ export const NAV_GROUPS = [
       { href: '/gta-6-clips', label: 'GTA 6 clips', sub: { en: 'Console captures', es: 'Capturas de consola' } },
       { href: '/wow-forever-clips', label: 'WoW Forever clips', sub: { en: 'Raids and streams', es: 'Bandas y directos' } },
       { href: '/auto-reframe', label: 'Auto reframe 9:16' },
-      { href: '/auto-clip', label: 'Auto clip', sub: 'Autopilot' },
-      { href: '/youtube-automation', label: 'YouTube automation' },
-      { href: '/ai-ugc-video-generator', label: 'AI UGC video ads', sub: { en: 'AI actors', es: 'Actores IA' } },
       { href: '/how-to', label: { en: 'How-to guides', es: 'Guías' }, sub: { en: 'Clip, self-host, automate', es: 'Recortar, autoalojar, automatizar' } },
     ],
   },
@@ -91,13 +86,12 @@ export const NAV_GROUPS = [
  * the footers only. The plan picker and checkout stay at the hash route
  * #/pricing?plan=..., a different thing: nginx sends /pricing?plan=... there. */
 export const NAV_LINKS = [
-  { href: '/#pricing', label: { en: 'Pricing', es: 'Precios' } },
   { href: '/self-hosted-ai-clip-maker', label: { en: 'Open source', es: 'Código abierto' } },
 ]
 
 export const NAV_STRINGS = {
-  en: { cta: 'Get free clips', ctaHint: 'First video free up to 60 min, no card. No watermark from $12/month, or self-host free (MIT).', openApp: 'Open app', login: 'Log in', menu: 'Menu', main: 'Main', github: 'OpenShorts on GitHub' },
-  es: { cta: 'Clips gratis', ctaHint: 'Primer vídeo gratis hasta 60 min, sin tarjeta. Sin marca de agua desde 12 $/mes, o autoalojado gratis (MIT).', openApp: 'Abrir la app', login: 'Iniciar sesión', menu: 'Menú', main: 'Principal', github: 'OpenShorts en GitHub' },
+  en: { cta: 'Get free clips', ctaHint: '100% free & open source, no watermarks, no usage limits.', openApp: 'Open app', login: 'Open app', menu: 'Menu', main: 'Main', github: 'Clarity on GitHub' },
+  es: { cta: 'Clips gratis', ctaHint: '100% gratis y código abierto, sin marca de agua ni límites.', openApp: 'Abrir la app', login: 'Abrir la app', menu: 'Menú', main: 'Principal', github: 'Clarity en GitHub' },
 }
 
 const pick = (v, lang) => (v && typeof v === 'object' ? v[lang] || v.en : v)
@@ -130,7 +124,7 @@ export function renderNav({ lang = 'en', signedIn = false, showLogin = true } = 
   const login = signedIn || !showLogin ? '' : `<a class="osn-login" href="${LOGIN_HREF}">${esc(t.login)}</a>`
   return `<header class="osn" data-osn>
 <div class="osn-bar">
-  <a class="osn-brand" href="/"><img src="/logo-openshorts.png" alt="OpenShorts logo" width="28" height="28"><span>openshorts</span></a>
+  <a class="osn-brand" href="/"><img src="/logo-openshorts.png" alt="Clarity logo" width="28" height="28"><span>clarity</span></a>
   <input type="checkbox" id="osn-toggle" class="osn-toggle" aria-label="${esc(t.menu)}">
   <label for="osn-toggle" class="osn-burger" title="${esc(t.menu)}">${BURGER}</label>
   <nav class="osn-menu" aria-label="${esc(t.main)}">

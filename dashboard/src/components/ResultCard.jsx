@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, FileText, Link2, Scissors, Crosshair, TrendingUp, Languages, Sparkles, Sliders } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import { track } from '../lib/analytics';
@@ -8,9 +8,7 @@ import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
-import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import TikTokDraftNotice from './TikTokDraftNotice';
-import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
@@ -63,7 +61,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onOpenCapCutStudio = null }) {
     const [showModal, setShowModal] = useState(false);
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
@@ -81,8 +79,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     }, [clip.why]);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
-    const [showWatermarkModal, setShowWatermarkModal] = useState(false);
-    const { plan } = useAuth();
     const videoRef = React.useRef(null);
     // Pristine base clip (no burned subtitles/hook), stable regardless of how
     // clip.video_url mutates after server edits. Used as the compositing base
@@ -237,9 +233,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [isEditing, setIsEditing] = useState(false);
     const [isSubtitling, setIsSubtitling] = useState(false);
     const [isHooking, setIsHooking] = useState(false);
-    const [isTranslating, setIsTranslating] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
+    const [isTranslating, setIsTranslating] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
+    const [isFixingCaptions, setIsFixingCaptions] = useState(false);
     const [editError, setEditError] = useState(null);
 
     const [clipDuration, setClipDuration] = useState(() => {
@@ -626,63 +623,41 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         }
     };
 
-    const handleTranslate = async (options) => {
-        console.log('[Translate] Starting translation with options:', options);
+    const handleTranslate = async ({ targetLanguage, voiceGender }) => {
         setIsTranslating(true);
         setEditError(null);
         try {
-            const apiKey = elevenLabsKey;
-            console.log('[Translate] API Key available:', !!apiKey);
-
-            if (!apiKey) {
-                throw new Error("ElevenLabs API Key is missing. Please set it in Settings.");
-            }
-
-            const requestBody = {
-                job_id: jobId,
-                clip_index: index,
-                target_language: options.targetLanguage,
-                input_filename: serverVideoFile
+            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
             };
-            console.log('[Translate] Request body:', requestBody);
-            console.log('[Translate] Sending request to /api/translate');
-
             const res = await apiFetch('/api/translate', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-ElevenLabs-Key': apiKey
-                },
-                body: JSON.stringify(requestBody)
+                headers,
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    target_language: targetLanguage,
+                    voice_gender: voiceGender || 'female',
+                    input_filename: serverVideoFile,
+                }),
             });
-
-            console.log('[Translate] Response status:', res.status);
-
             if (!res.ok) {
                 const errText = await res.text();
-                console.error('[Translate] Error response:', errText);
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch (e) {
-                    if (e.message !== errText) throw e;
-                    throw new Error(errText);
-                }
+                let detail = errText;
+                try { detail = JSON.parse(errText).detail || errText; } catch { /* ignore */ }
+                throw new Error(detail);
             }
-
             const data = await res.json();
-            console.log('[Translate] Success response:', data);
-            if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                setServerVideoFile(data.new_video_url.split('/').pop());
-                if (videoRef.current) {
-                    videoRef.current.load();
-                }
+            const newUrl = data.new_video_url || data.video_url;
+            if (newUrl) {
+                setCurrentVideoUrl(getApiUrl(newUrl));
+                setServerVideoFile(newUrl.split('/').pop());
+                if (videoRef.current) videoRef.current.load();
                 setShowTranslateModal(false);
             }
-
         } catch (e) {
-            console.error('[Translate] Exception:', e);
             setEditError(e.message);
             setTimeout(() => setEditError(null), 5000);
         } finally {
@@ -690,7 +665,45 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         }
     };
 
-    // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
+    const handleFixCaptions = async () => {
+        setIsFixingCaptions(true);
+        setEditError(null);
+        try {
+            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(apiKey ? { 'X-Gemini-Key': apiKey } : {}),
+            };
+            const res = await apiFetch('/api/clip/fix-captions', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    romanize: true,
+                    preset: 'tiktok',
+                }),
+            });
+            if (!res.ok) {
+                const errText = await res.text();
+                let detail = errText;
+                try { detail = JSON.parse(errText).detail || errText; } catch { /* ignore */ }
+                throw new Error(detail);
+            }
+            const data = await res.json();
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setServerVideoFile(data.new_video_url.split('/').pop());
+                if (videoRef.current) videoRef.current.load();
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setIsFixingCaptions(false);
+        }
+    };
+
     const canPost = isManaged || (uploadPostKey && uploadUserId);
 
     const handlePost = async () => {
@@ -845,7 +858,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     {Number.isFinite(clip.predicted_score) && (
                         <span
                             className="bg-black/70 font-mono text-micro uppercase px-2 py-1 rounded-full flex items-center gap-1"
-                            title="openshorts' prediction of how well this clip will perform, from 0 to 100"
+                            title="clarity's prediction of how well this clip will perform, from 0 to 100"
                         >
                             <TrendingUp size={11} className="shrink-0 text-muted" />
                             <span className="text-muted">viral</span>
@@ -889,7 +902,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                                 ref={whyRef}
                                 className={`text-xs text-muted leading-snug line-clamp-2 break-words ${whyClamped ? 'cursor-pointer' : ''}`}
                                 onClick={() => whyClamped && setWhyOpen(v => !v)}
-                                aria-label="why openshorts picked this moment"
+                                aria-label="why clarity picked this moment"
                             >
                                 {clip.why}
                             </p>
@@ -969,6 +982,17 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         </button>
                     )}
 
+                    {onOpenCapCutStudio && (
+                        <button
+                            onClick={() => onOpenCapCutStudio(index, clip)}
+                            className={QUIET_BTN}
+                            title="Open in CapCut Pro Studio (Timeline, Speed Curves, Optical Flow, VFX, Masks, Music, AI Tools)"
+                        >
+                            <Sliders size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                            capcut studio
+                        </button>
+                    )}
+
                     {onReframeClip && (
                         <button
                             onClick={() => onReframeClip(index)}
@@ -1010,9 +1034,20 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         onClick={() => setShowTranslateModal(true)}
                         disabled={isTranslating}
                         className={QUIET_BTN}
+                        title="100% Free Neural Voice Dubbing (31+ languages)"
                     >
                         {isTranslating ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Languages size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
-                        {isTranslating ? 'translating…' : 'dub voice'}
+                        {isTranslating ? 'dubbing…' : 'dub voice'}
+                    </button>
+
+                    <button
+                        onClick={handleFixCaptions}
+                        disabled={isFixingCaptions}
+                        className={QUIET_BTN}
+                        title="AI Caption Word Fixer & Hinglish/Urdu Romanizer (PeakCut)"
+                    >
+                        {isFixingCaptions ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Sparkles size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
+                        {isFixingCaptions ? 'fixing…' : 'fix words'}
                     </button>
 
                     <button
@@ -1024,12 +1059,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     <button
                         onClick={(e) => {
                             e.preventDefault();
-                            // Free clips are watermarked — surface the upsell once
-                            // before the first download, then get out of the way.
-                            if (plan === 'free' && !watermarkNoticeDismissed(jobId)) {
-                                setShowWatermarkModal(true);
-                                return;
-                            }
                             downloadClip();
                         }}
                         className={`${QUIET_BTN}${onEditClip ? ' col-span-2' : ''}`}
@@ -1239,19 +1268,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 onClose={() => setShowTranslateModal(false)}
                 onTranslate={handleTranslate}
                 isProcessing={isTranslating}
-                videoUrl={currentVideoUrl}
-                hasApiKey={!!elevenLabsKey}
+                videoUrl={playbackUrl}
             />
-
-            {showWatermarkModal && (
-                <WatermarkModal
-                    source="download"
-                    jobId={jobId}
-                    onUpgrade={onUpgrade}
-                    onClose={() => setShowWatermarkModal(false)}
-                    onContinue={downloadClip}
-                />
-            )}
 
         </div>
     );
