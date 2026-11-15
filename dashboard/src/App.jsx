@@ -1456,8 +1456,17 @@ function App() {
                         </p>
                       </div>
                     ) : status === 'error' ? (
-                      <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-2">
-                        <p>Generation failed.</p>
+                      <div className="h-full min-h-[180px] flex flex-col items-center justify-center text-danger space-y-3 p-6 text-center">
+                        <p className="text-sm font-medium">Generation failed.</p>
+                        <p className="text-xs text-muted max-w-sm">
+                          Click below to clear the failed session and start a fresh project.
+                        </p>
+                        <button
+                          onClick={handleReset}
+                          className="btn-primary px-4 py-2 text-xs"
+                        >
+                          + Start New Project
+                        </button>
                       </div>
                     ) : null
                   )}
