@@ -4444,7 +4444,7 @@ def _job_nice():
 
 def _lower_priority():
     n = _job_nice()
-    if n:
+    if n and hasattr(os, "nice"):
         os.nice(n)
 
 
@@ -4569,13 +4569,19 @@ async def _run_main(job_id, cmd, env, tick=None):
     called every couple of seconds. Cancelled (the server is stopping): the
     child is killed so it cannot keep writing into the job dir while the next
     instance resumes the same job."""
+    extra_popen = {}
+    if sys.platform != "win32":
+        extra_popen["preexec_fn"] = _lower_priority
+    elif _job_nice() and hasattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS"):
+        extra_popen["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, # Merge stderr to stdout
         env=env,
         cwd=os.getcwd(),
-        preexec_fn=_lower_priority,
+        **extra_popen,
     )
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
