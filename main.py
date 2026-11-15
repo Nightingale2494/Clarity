@@ -96,10 +96,14 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 # volume mounted over the workdir doesn't trigger a re-download at startup.
 model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
 
-# --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# --- MediaPipe / Face Detection Setup ---
+# Use standard Face Detection (BlazeFace) if available, with robust YOLO fallback
+if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+    mp_face_detection = mp.solutions.face_detection
+    face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+else:
+    mp_face_detection = None
+    face_detection = None
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -443,28 +447,53 @@ def detect_face_candidates(frame):
     MediaPipe's relative coords make the mapping exact).
     """
     height, width, _ = frame.shape
-    small, _scale = _detection_frame(frame)
-    rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-    with DETECT_LOCK:
-        results = face_detection.process(rgb_frame)
-    
+    small, scale = _detection_frame(frame)
+
+    if face_detection is not None:
+        rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        with DETECT_LOCK:
+            results = face_detection.process(rgb_frame)
+        
+        candidates = []
+        if results and results.detections:
+            for detection in results.detections:
+                bboxC = detection.location_data.relative_bounding_box
+                x = int(bboxC.xmin * width)
+                y = int(bboxC.ymin * height)
+                w = int(bboxC.width * width)
+                h = int(bboxC.height * height)
+                candidates.append({
+                    'box': [x, y, w, h],
+                    'score': w * h # Area as score
+                })
+            return candidates
+
+    # Fallback to YOLO person head/upper-body bounding box
     candidates = []
-    
-    if not results.detections:
-        return []
-        
-    for detection in results.detections:
-        bboxC = detection.location_data.relative_bounding_box
-        x = int(bboxC.xmin * width)
-        y = int(bboxC.ymin * height)
-        w = int(bboxC.width * width)
-        h = int(bboxC.height * height)
-        
-        candidates.append({
-            'box': [x, y, w, h],
-            'score': w * h # Area as score
-        })
-            
+    try:
+        with DETECT_LOCK:
+            results = model(small, verbose=False, classes=[0])
+        for r in results:
+            for box in r.boxes:
+                bx = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = bx[:4]
+                pw = x2 - x1
+                ph = y2 - y1
+                # Head/face region is roughly top 35% of person detection
+                fw = pw * 0.70
+                fh = min(ph * 0.35, fw * 1.3)
+                fx = x1 + (pw - fw) / 2
+                fy = y1
+                x = int(fx / scale)
+                y = int(fy / scale)
+                w = int(fw / scale)
+                h = int(fh / scale)
+                candidates.append({
+                    'box': [x, y, w, h],
+                    'score': w * h
+                })
+    except Exception:
+        pass
     return candidates
 
 def detect_person_yolo(frame):
